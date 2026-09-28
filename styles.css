@@ -120,6 +120,7 @@ button { font-family: inherit; }
 
 /* ------------------------------------------------------------------ topbar */
 .topbar {
+  grid-area: top;
   position: relative;
   z-index: 30;
   display: flex;
@@ -270,6 +271,7 @@ button { font-family: inherit; }
 
 /* ---------------------------------------------------------------- banners */
 .banner-host {
+  grid-area: banner;
   position: relative;
   z-index: 28;
   display: flex;
@@ -306,9 +308,11 @@ button { font-family: inherit; }
 
 /* ---------------------------------------------------------------- sidebar */
 .sidebar {
+  grid-area: side;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   background: var(--sidebar-bg);
   border-right: 1px solid var(--border);
   overflow: hidden;
@@ -445,7 +449,13 @@ button { font-family: inherit; }
   z-index: 2;
   display: grid;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr) 0;
-  height: calc(100vh - var(--topbar-h));
+  grid-template-rows: auto auto minmax(0, 1fr);
+  /* the sidebar spans every row: full-height rail, exactly like ChatGPT */
+  grid-template-areas:
+    "side top    top"
+    "side banner banner"
+    "side chat   preview";
+  height: 100vh;
   transition: grid-template-columns 0.26s var(--ease);
 }
 .layout.has-preview { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) minmax(320px, 42%); }
@@ -455,6 +465,7 @@ button { font-family: inherit; }
 
 /* ---------------------------------------------------------------- preview */
 .preview-drawer {
+  grid-area: preview;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -499,9 +510,11 @@ button { font-family: inherit; }
 
 /* ------------------------------------------------------------------- chat */
 .chat {
+  grid-area: chat;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   overflow: hidden;
   background: var(--canvas);
 }
@@ -1265,7 +1278,7 @@ button { font-family: inherit; }
 
   .sidebar {
     position: fixed;
-    top: var(--topbar-h);
+    top: 0;
     bottom: 0;
     left: 0;
     z-index: 50;
@@ -1278,11 +1291,11 @@ button { font-family: inherit; }
   .layout.sidebar-open .scrim {
     display: block;
     position: fixed;
-    inset: var(--topbar-h) 0 0 0;
+    inset: 0;
     z-index: 45;
     background: rgba(0, 0, 0, 0.5);
   }
-  .layout.has-preview .preview-drawer { position: fixed; inset: var(--topbar-h) 0 0 0; z-index: 55; }
+  .layout.has-preview .preview-drawer { position: fixed; inset: 0; z-index: 55; }
 
   .chat-scroll { padding: 16px 14px 4px; }
   .composer-wrap { padding: 4px 10px calc(8px + env(safe-area-inset-bottom, 0px)); }
