@@ -2,69 +2,102 @@
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cline Web — ChatGPT-style AI coding agent</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cline Web — AI coding agent in your browser</title>
 <meta name="description" content="A browser-based, ChatGPT-style AI coding assistant. Pick a folder, chat, and let the model create and edit real files on your disk.">
 <meta name="color-scheme" content="dark light">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<meta name="theme-color" content="#212121">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230d0d0d'/><path d='M50 18v64M18 50h64' stroke='%23fff' stroke-width='9' stroke-linecap='round'/></svg>">
 <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
-<div class="aurora" aria-hidden="true"></div>
-<div class="grid-overlay" aria-hidden="true"></div>
 
+<!-- ============================================================ top bar -->
 <header class="topbar">
-  <div class="topbar-left">
-    <button id="btn-toggle-sidebar" class="icon-btn" type="button" title="Toggle sidebar" aria-label="Toggle sidebar">☰</button>
+  <button id="btn-toggle-sidebar" class="icon-btn" type="button" title="Toggle sidebar" aria-label="Toggle sidebar">
+    <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+  </button>
 
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true">⚡</span>
-      <span class="brand-text">Cline<em>Web</em></span>
-    </div>
+  <button id="modelPill" class="model-pill" type="button" title="Switch model">
+    <span id="modelPillLabel" class="model-pill-label">Loading models…</span>
+    <span id="modelPillPrice" class="model-pill-sub"></span>
+    <span class="model-pill-caret" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="15" height="15"><path d="M6 9.5 12 15l6-5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </span>
+  </button>
 
-    <button id="modelPill" class="pill model-pill" type="button" title="Choose a model">
-      <span class="dot" aria-hidden="true"></span>
-      <span id="modelPillLabel" class="pill-label">Loading models…</span>
-      <span id="modelPillPrice" class="pill-sub"></span>
-      <span class="pill-caret" aria-hidden="true">▾</span>
+  <div class="topbar-spacer"></div>
+
+  <button id="folderChip" class="folder-chip" type="button" title="Open or change workspace folder">
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 7.5A2 2 0 0 1 5 5.5h3.6l1.7 2h6.7a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+    <span id="folderChipName" class="folder-chip-label">No folder open</span>
+    <span id="folderChipPerm" class="folder-chip-sub"></span>
+  </button>
+
+  <div class="topbar-actions">
+    <button id="btn-connections" class="icon-btn" type="button" title="API keys &amp; connections" aria-label="API keys and connections">
+      <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M14.5 9.5 20 4m-3.2 1.3 2.9 2.9M9.8 14.2a4.2 4.2 0 1 1-5.9-5.9l3-3 5.9 5.9-3 3Zm0 0 2.2 2.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
-  </div>
-
-  <div class="topbar-center">
-    <button id="folderChip" class="pill folder-chip" type="button" title="Open or change workspace folder">
-      <span aria-hidden="true">📁</span>
-      <span id="folderChipName" class="pill-label">No folder open</span>
-      <span id="folderChipPerm" class="pill-sub"></span>
+    <button id="btn-settings" class="icon-btn" type="button" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><circle cx="12" cy="12" r="3.1" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3.4v2.2M12 18.4v2.2M3.4 12h2.2M18.4 12h2.2M6 6l1.6 1.6M16.4 16.4 18 18M18 6l-1.6 1.6M7.6 16.4 6 18" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
     </button>
-  </div>
-
-  <div class="topbar-right">
-    <button id="btn-connections" class="icon-btn" type="button" title="Connections &amp; API keys" aria-label="Connections and API keys">🔑</button>
-    <button id="btn-settings" class="icon-btn" type="button" title="Settings" aria-label="Settings">⚙</button>
-    <button id="btn-theme" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">🌗</button>
+    <button id="btn-theme" class="icon-btn" type="button" title="Switch theme" aria-label="Switch theme">
+      <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M20 14.2A8.4 8.4 0 0 1 9.8 4a8.5 8.5 0 1 0 10.2 10.2Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+    </button>
   </div>
 </header>
 
 <div id="bannerHost" class="banner-host" role="status" aria-live="polite"></div>
-
+<!-- ============================================================ shell -->
 <main class="layout">
-  <aside id="sidebar" class="sidebar" aria-label="Workspace explorer">
+  <div class="scrim" aria-hidden="true"></div>
+
+  <!-- ------------------------------------------------------ sidebar -->
+  <aside id="sidebar" class="sidebar" aria-label="Explorer and navigation">
     <div class="sidebar-head">
-      <span class="sidebar-title">Explorer</span>
-      <div class="sidebar-actions">
-        <button id="btn-undo" class="mini-btn" type="button" title="Undo history">↩ <span id="undoCount">0</span></button>
-        <button id="btn-refresh-tree" class="mini-btn" type="button" title="Refresh">⟳</button>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="17" height="17"><path d="M12 3v18M3 12h18" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"/></svg>
+        </span>
+        <span class="brand-text">Cline Web</span>
       </div>
     </div>
 
-    <div class="sidebar-controls">
-      <input id="sidebarSearch" class="mini-input" type="search" placeholder="Filter files…" aria-label="Filter files">
+    <nav class="sidebar-nav" aria-label="Quick actions">
+      <button id="btn-new-chat" class="nav-row" type="button">
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="nav-label">New chat</span>
+      </button>
+      <button id="btn-refresh-tree" class="nav-row" type="button">
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M20 12a8 8 0 1 1-2.6-5.9M20 4.5V10h-5.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="nav-label">Refresh files</span>
+      </button>
+      <button id="btn-undo" class="nav-row" type="button" title="Restore a previous version of a file">
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path d="M9 14 4 9l5-5M4 9h9a6 6 0 1 1 0 12H8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="nav-label">History</span>
+        <span id="undoCount" class="nav-count">0</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-section">
+      <div class="section-head">
+        <span class="section-title">Explorer</span>
+      </div>
+      <div class="sidebar-controls">
+        <input id="sidebarSearch" class="mini-input" type="search" placeholder="Search files" aria-label="Search files">
+      </div>
     </div>
 
     <div id="workspaceBar" class="workspace-bar">
-      <button id="btn-open-folder-side" class="btn btn-primary btn-block" type="button">Open folder…</button>
+      <button id="btn-open-folder-side" class="btn btn-primary btn-block" type="button">Open folder</button>
       <button id="btn-reconnect-folder" class="btn btn-ghost btn-block hidden" type="button">Reconnect folder</button>
-      <button id="btn-zip-mode" class="btn btn-ghost btn-block" type="button">Read-only (ZIP) mode…</button>
+      <button id="btn-zip-mode" class="btn btn-ghost btn-block" type="button">Read-only (zip) mode</button>
     </div>
 
     <nav id="treeRoot" class="tree" aria-label="Files"></nav>
@@ -73,15 +106,17 @@
       <span id="zipBarLabel" class="muted small">Read-only mode</span>
       <button id="btn-download-zip" class="btn btn-primary btn-sm" type="button">Download .zip</button>
     </div>
-  </aside>
 
-  <section class="chat" aria-label="Chat">
+    <div class="sidebar-foot">
+      <span id="wsStatus" class="foot-status"></span>
+    </div>
+  </aside>
+  <!-- --------------------------------------------------------- thread -->
+  <section class="chat is-empty" aria-label="Chat">
     <div id="chatScroll" class="chat-scroll">
       <div id="emptyState" class="empty-state">
-        <div class="empty-badge" aria-hidden="true">⚡</div>
-        <h1>What should we <span class="grad">build today?</span></h1>
-        <p class="muted">Pick a model, open a folder — or just start typing and I'll scaffold one. Every file the model writes lands on your real disk.</p>
-        <div id="starterList" class="starters"></div>
+        <h1>What can I help with?</h1>
+        <p class="muted">Pick a model, open a folder, or just start typing — every file the agent writes lands on your real disk.</p>
       </div>
       <div id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
     </div>
@@ -91,35 +126,46 @@
       <span id="stepText">Thinking…</span>
       <button id="btn-stop" class="mini-btn danger" type="button">Stop</button>
     </div>
-<div class="composer-wrap">
+
+    <div class="composer-wrap">
       <div id="contextChips" class="context-chips"></div>
       <div id="attachments" class="attachments"></div>
+
       <div class="composer">
-        <textarea id="promptInput" class="composer-input" rows="1" placeholder="Ask Cline to build, fix or refactor…  (Enter to send · Shift+Enter for newline)"></textarea>
-        <div class="composer-side">
-          <button id="btn-attach" class="icon-btn" type="button" title="Attach an image">🖼</button>
+        <textarea id="promptInput" class="composer-input" rows="1" placeholder="Ask anything" aria-label="Message"></textarea>
+        <div class="composer-tools">
+          <button id="btn-attach" class="tool-btn" type="button" title="Attach images" aria-label="Attach images">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+          </button>
           <input id="attachInput" type="file" accept="image/*" multiple hidden>
           <div class="composer-grow" aria-hidden="true"></div>
-          <button id="btn-send" class="send-btn" type="button" title="Send" aria-label="Send message">➤</button>
+          <span id="usageModel" class="composer-note"></span>
+          <button id="btn-send" class="send-btn" type="button" title="Send" aria-label="Send message">
+            <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M12 19V5.6M6.2 11.4 12 5.6l5.8 5.8" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
         </div>
       </div>
+
+      <div id="starterList" class="starters"></div>
+
       <div class="usage-bar">
-        <span id="usageModel" class="muted small"></span>
         <span id="usageTokens" class="muted small">0 tokens</span>
         <span id="usageCost" class="muted small">$0.0000</span>
         <span id="cacheBadge" class="badge hidden"></span>
         <div class="usage-spacer"></div>
-        <span id="wsStatus" class="muted small"></span>
       </div>
     </div>
   </section>
 
+  <!-- -------------------------------------------------------- preview -->
   <section id="previewDrawer" class="preview-drawer hidden" aria-label="File preview">
     <div class="preview-head">
       <span id="previewTitle" class="preview-title">file</span>
       <div class="preview-actions">
-        <button id="btn-add-context" class="mini-btn" type="button" title="Add this file to the prompt">＋context</button>
-        <button id="btn-close-preview" class="mini-btn" type="button" title="Close">✕</button>
+        <button id="btn-add-context" class="mini-btn" type="button" title="Add this file to the prompt">Add to chat</button>
+        <button id="btn-close-preview" class="icon-btn" type="button" title="Close preview" aria-label="Close preview">
+          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+        </button>
       </div>
     </div>
     <pre id="previewBody" class="preview-body"></pre>

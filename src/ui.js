@@ -352,7 +352,45 @@ function syncWorkspaceStatus() {
 
 /* ------------------------------------------------------------------ messages */
 
-function hideEmptyState() { $('emptyState').classList.add('hidden'); }
+function chatShell() { return document.querySelector('.chat'); }
+
+function hideEmptyState() {
+  $('emptyState').classList.add('hidden');
+  const chat = chatShell();
+  if (chat) chat.classList.remove('is-empty');
+}
+
+function showEmptyState() {
+  $('emptyState').classList.remove('hidden');
+  const chat = chatShell();
+  if (chat) chat.classList.add('is-empty');
+}
+
+function closeMobileSidebar() {
+  if (!window.matchMedia('(max-width: 900px)').matches) return;
+  const layout = document.querySelector('.layout');
+  if (layout) layout.classList.remove('sidebar-open');
+}
+
+/** Clears the thread and returns to the new-chat state (ChatGPT "New chat"). */
+function newChat() {
+  if (agent.isRunning) agent.stop();
+  $('messages').innerHTML = '';
+  agent.reset();
+  state.attachments = [];
+  state.contextFiles = [];
+  state.usage = { input: 0, output: 0 };
+  state.lastUserPrompt = '';
+  renderAttachments();
+  renderContextChips();
+  updateUsageBar(state.usage);
+  $('promptInput').value = '';
+  autosizeInput();
+  closePreview();
+  $('stepStrip').classList.add('hidden');
+  showEmptyState();
+  scrollToBottom();
+}
 
 function starterPrompts() {
   return [
@@ -766,6 +804,7 @@ function renderTreeNode(node, depth) {
       document.querySelectorAll('.tree-node.is-active').forEach((n) => n.classList.remove('is-active'));
       btn.classList.add('is-active');
       await openPreview(node.path);
+      closeMobileSidebar();
     }
   });
   if (isDir && expanded && node.children && node.children.length) {
@@ -1677,10 +1716,13 @@ async function reconnectWorkspace() {
 
 function bindStaticUI() {
   const layout = document.querySelector('.layout');
+  const scrim = document.querySelector('.scrim');
+  if (scrim) scrim.addEventListener('click', () => layout.classList.remove('sidebar-open'));
   $('btn-toggle-sidebar').addEventListener('click', () => {
     if (window.matchMedia('(max-width: 900px)').matches) layout.classList.toggle('sidebar-open');
     else layout.classList.toggle('no-sidebar');
   });
+  $('btn-new-chat').addEventListener('click', () => { newChat(); closeMobileSidebar(); });
   $('modelPill').addEventListener('click', openModelPicker);
   $('folderChip').addEventListener('click', () => {
     if (workspace.mode === 'zip') openZipMode();
