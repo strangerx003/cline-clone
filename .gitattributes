@@ -1,0 +1,15 @@
+# Normalise text files to LF in the repo…
+* text=auto eol=lf
+
+# …but keep Windows batch scripts on CRLF, otherwise cmd.exe mis-parses
+# labels/goto and the one-click launcher stops working.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch binaries
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
