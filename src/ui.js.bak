@@ -1,0 +1,2270 @@
+// Cline Web — application controller.
+// Wires the chat, the model picker, connection manager, workspace explorer and
+// the file-writing agent loop together.
+
+import { APP_CONFIG } from './config.js';
+import { DEFAULT_CATALOG, filterModels, groupModels, priceLabel, formatContext, suggestModel } from './models.js';
+import { PROVIDER_PRESETS, detectProvider, normalizeApiKey, maskApiKey } from './providers.js';
+import {
+  getSettings, saveSettings, getConnections, saveConnections, upsertConnection,
+  deleteConnection, getActiveConnection, makeConnection, getRecents, pushRecentModel,
+  pushRecentPrompt, setStorageMode, getStorageMode, undoStore, zipModeStore
+} from './store.js';
+import {
+  supportsFileSystemAccess, supportsReadOnlyFallback, pickDirectory, saveRootHandle,
+  loadRootHandle, forgetRootHandle, verifyPermission, readFileText, writeFileText,
+  createFolder, deleteEntry, buildTree, fileExists, parseIgnoreGlobs,
+  readFromFileList, slugifyPrompt, uniqueName, timestampSlug, normalizePath, joinPath, basename, extname
+} from './fs.js';
+import { listModels, testConnection, ApiError } from './api.js';
+import { SimpleZip } from './zip.js';
+import { Agent, AgentEvents } from './agent.js';
+import { parseOps, OP_META, escapeHtml, renderMarkdown, highlight, toHunks, diffStats } from './tools.js';
+
+/* ------------------------------------------------------------------ helpers */
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') node.className = v;
+    else if (k === 'html') node.innerHTML = v;
+    else if (k === 'text') node.textContent = v;
+    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+    else if (k === 'dataset') Object.assign(node.dataset, v);
+    else if (k === 'style' && typeof v === 'object') Object.assign(node.style, v);
+    else node.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const child of children.flat()) {
+    if (child == null || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function toast(message, kind = 'info', { title = '', timeout = 5200 } = {}) {
+  const host = $('toastHost');
+  const icons = { info: 'ℹ️', ok: '✅', err: '⚠️', warn: '⚠️' };
+  const node = el('div', { class: `toast ${kind}` },
+    el('span', { class: 't-icon', text: icons[kind] || 'ℹ️' }),
+    el('div', { class: 't-text' }, title ? el('strong', { text: `${title} ` }) : null, el('span', { text: message })),
+    el('button', { class: 't-close', type: 'button', text: '✕', onclick: () => node.remove() })
+  );
+  host.append(node);
+  if (timeout) setTimeout(() => node.remove(), timeout);
+  return node;
+}
+
+const banners = new Map();
+
+function clearBanner(key) {
+  const existing = banners.get(key);
+  if (existing) { existing.remove(); banners.delete(key); }
+}
+
+function banner(key, { kind = 'info', title = '', message = '', hint = '', link = '', linkText = '' } = {}) {
+  clearBanner(key);
+  const body = el('div', { class: 'banner-body' });
+  if (title) body.append(el('strong', { class: 'banner-title', text: title }));
+  if (message) body.append(el('span', { text: message }));
+  if (hint) body.append(el('div', { class: 'banner-hint', text: hint }));
+  if (link) body.append(el('div', {}, el('a', { href: link, target: '_blank', rel: 'noopener noreferrer', text: linkText || link })));
+  const node = el('div', { class: `banner ${kind}` }, body,
+    el('button', { class: 'mini-btn t-close', type: 'button', text: '✕', onclick: () => { node.remove(); banners.delete(key); } })
+  );
+  $('bannerHost').append(node);
+  banners.set(key, node);
+  return node;
+}
+
+function openModal({ title, sub = '', size = '', body, footer = [], onClose = null }) {
+  const backdrop = el('div', { class: 'modal-backdrop' });
+  const closeBtn = el('button', { class: 'icon-btn modal-close', type: 'button', text: '✕', title: 'Close' });
+  const modal = el('div', { class: `modal ${size}` },
+    el('div', { class: 'modal-head' },
+      el('div', {}, el('div', { class: 'modal-title', text: title }), sub ? el('div', { class: 'modal-sub', text: sub }) : null),
+      closeBtn
+    ),
+    el('div', { class: 'modal-body' }, body),
+    footer.length ? el('div', { class: 'modal-foot' }, footer) : null
+  );
+  backdrop.append(modal);
+  $('modalHost').append(backdrop);
+
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  const close = () => {
+    backdrop.remove();
+    document.removeEventListener('keydown', onKey);
+    if (onClose) onClose();
+  };
+  document.addEventListener('keydown', onKey);
+  closeBtn.addEventListener('click', close);
+  backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) close(); });
+  return { close, modal, backdrop };
+}
+
+function confirmDialog({ title, message, confirmText = 'Confirm', danger = false }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const dialog = openModal({
+      title,
+      size: 'narrow',
+      body: el('p', { class: 'muted', text: message }),
+      footer: [
+        el('div', { class: 'spacer' }),
+        el('button', { class: 'btn btn-ghost', type: 'button', text: 'Cancel', onclick: () => finish(false) }),
+        el('button', { class: `btn ${danger ? 'btn-danger' : 'btn-primary'}`, type: 'button', text: confirmText, onclick: () => finish(true) })
+      ],
+      onClose: () => { if (!settled) { settled = true; resolve(false); } }
+    });
+    function finish(v) {
+      if (settled) return;
+      settled = true;
+      dialog.close();
+      resolve(v);
+    }
+  });
+}
+
+function switchControl(checked, onChange, label = '', desc = '') {
+  const input = el('input', { type: 'checkbox' });
+  input.checked = !!checked;
+  input.addEventListener('change', () => onChange(input.checked));
+  return el('div', { class: 'toggle-row' },
+    el('div', {}, el('div', { class: 't-label', text: label }), desc ? el('div', { class: 't-desc', text: desc }) : null),
+    el('label', { class: 'switch' }, input, el('span'))
+  );
+}
+
+function kindIcon(path, kind) {
+  if (kind === 'directory') return { glyph: '▸', cls: 'k-dir' };
+  const ext = extname(path);
+  const map = {
+    js: ['🟨', 'k-js'], mjs: ['🟨', 'k-js'], cjs: ['🟨', 'k-js'], jsx: ['⚛️', 'k-js'],
+    ts: ['🔷', 'k-ts'], tsx: ['🔷', 'k-ts'], py: ['🐍', 'k-py'], html: ['🌐', 'k-html'],
+    css: ['🎨', 'k-css'], scss: ['🎨', 'k-css'], json: ['🧩', 'k-json'], md: ['📝', 'k-md'],
+    png: ['🖼️', 'k-img'], jpg: ['🖼️', 'k-img'], jpeg: ['🖼️', 'k-img'], gif: ['🖼️', 'k-img'],
+    svg: ['🖼️', 'k-img'], sh: ['🐚', 'k-sh'], ps1: ['🐚', 'k-sh'], yml: ['🧾', 'k-json'], yaml: ['🧾', 'k-json']
+  };
+  const hit = map[ext] || ['📄', ''];
+  return { glyph: hit[0], cls: hit[1] };
+}
+
+function familyGlyph(family) {
+  const map = {
+    deepseek: '🐋', xiaomi: '🟠', qwen: '🟣', openai: '⚫', anthropic: '🅰️',
+    google: '🔵', 'z-ai': '🟩', xai: '✖️', moonshot: '🌙', meta: '🔷', mistral: '🌬️'
+  };
+  return map[family] || '✨';
+}
+
+function scrollToBottom() {
+  const box = $('chatScroll');
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result));
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(file);
+  });
+}
+
+function fmtTime(ms) {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+/* -------------------------------------------------------------------- state */
+
+const state = {
+  connections: [],
+  activeConnection: null,
+  catalog: [],
+  catalogByProvider: {},
+  catalogLive: false,
+  catalogUpdatedAt: 0,
+  model: '',
+  favourites: [],
+  recents: { models: [], prompts: [] },
+  attachments: [],
+  contextFiles: [],
+  usage: { input: 0, output: 0 },
+  cacheLayer: '',
+  treeExpanded: new Set(),
+  currentPreview: null,
+  lastUserPrompt: ''
+};
+
+const workspace = {
+  ready: false,
+  name: '',
+  root: null,
+  mode: 'none',
+  overlay: new Map(),
+  zipFiles: [],
+  get ignorePatterns() { return parseIgnoreGlobs(getSettings().ignoreGlobs); },
+  async exists(path) {
+    if (this.mode === 'zip') {
+      if (this.overlay.has(path)) return this.overlay.get(path) !== null;
+      return this.zipFiles.some((f) => f.path === path);
+    }
+    if (!this.root) return false;
+    try { return await fileExists(this.root, path); } catch { return false; }
+  },
+  async readText(path) {
+    if (this.mode === 'zip') {
+      if (this.overlay.has(path)) {
+        const v = this.overlay.get(path);
+        if (v == null) { const e = new Error(`File not found: ${path}`); e.code = 'not_found'; throw e; }
+        return v;
+      }
+      const hit = this.zipFiles.find((f) => f.path === path);
+      if (!hit) { const e = new Error(`File not found: ${path}`); e.code = 'not_found'; throw e; }
+      return hit.text;
+    }
+    return readFileText(this.root, path);
+  },
+  async writeText(path, text) {
+    if (this.mode === 'zip') { this.overlay.set(normalizePath(path), String(text)); return; }
+    await writeFileText(this.root, path, text);
+  },
+  async makeFolder(path) {
+    if (this.mode === 'zip') return;
+    await createFolder(this.root, path);
+  },
+  async remove(path) {
+    if (this.mode === 'zip') { this.overlay.set(normalizePath(path), null); return; }
+    await deleteEntry(this.root, path);
+  },
+  async snapshot(path, reason = 'edit') {
+    let previous = null;
+    try { previous = await this.readText(path); } catch { previous = null; }
+    if (previous != null) {
+      await undoStore.push({ path: normalizePath(path), text: previous, reason, mode: this.mode });
+      refreshUndoCount();
+    }
+    return previous;
+  },
+  async refresh() { await renderTree(); }
+};
+
+/* ------------------------------------------------------------------- agent */
+
+const agent = new Agent({
+  getConnection: () => state.activeConnection,
+  getModel: () => state.model,
+  getSettings: () => getSettings(),
+  workspace
+});
+
+let activeStream = null;
+
+function setRunning(running) {
+  $('stepStrip').classList.toggle('hidden', !running);
+  $('btn-send').disabled = running;
+  $('promptInput').disabled = running;
+  if (!running) setStepText('Thinking…');
+}
+
+function setStepText(text) { $('stepText').textContent = text; }
+
+agent
+  .on(AgentEvents.STEP_START, ({ step, of }) => {
+    setStepText(`Step ${step} of ${of} — asking the model…`);
+    hideEmptyState();
+  })
+  .on(AgentEvents.DELTA, (chunk) => {
+    if (!activeStream) activeStream = beginAssistantMessage();
+    activeStream.text += chunk;
+    renderStreamingBody(activeStream);
+    setStepText('Writing…');
+  })
+  .on(AgentEvents.REASONING, (chunk) => {
+    if (!activeStream) activeStream = beginAssistantMessage();
+    activeStream.reasoning += chunk;
+    renderReasoningBody(activeStream);
+  })
+  .on(AgentEvents.USAGE, ({ usage, replace }) => {
+    state.usage.input = replace ? Math.max(state.usage.input, usage.input_tokens) : state.usage.input + usage.input_tokens;
+    state.usage.output = usage.output_tokens || state.usage.output;
+    updateUsageBar(state.usage);
+  })
+  .on(AgentEvents.META, ({ cacheLayer }) => {
+    state.cacheLayer = cacheLayer || '';
+    updateUsageBar(state.usage);
+  })
+  .on(AgentEvents.ASSISTANT_DONE, ({ prose }) => {
+    if (activeStream) {
+      if (prose && prose.trim()) activeStream.text = prose;
+      finalizeAssistantMessage(activeStream, { usageText: `${state.usage.input.toLocaleString()} in · ${state.usage.output.toLocaleString()} out` });
+      activeStream = null;
+    }
+  })
+  .on(AgentEvents.OPS, ({ batch }) => {
+    const host = el('div', { class: 'ops-batch' });
+    for (const item of batch) {
+      const card = renderOpCard(item);
+      if (item.status === 'pending') renderOpPending(card, item);
+      host.append(card);
+    }
+    if (host.children.length) { $('messages').append(host); scrollToBottom(); }
+  })
+  .on(AgentEvents.OP_RESULT, (res) => {
+    const card = document.querySelector(`[data-op="${res.id}"]`);
+    if (card) renderOpResult(card, res);
+    refreshUndoCount();
+  })
+  .on(AgentEvents.CONTINUE, ({ reason, step }) => {
+    setStepText(reason === 'read' ? 'Reading the files I asked for…' : `Retrying after an issue — step ${step + 1}…`);
+  })
+  .on(AgentEvents.DONE, ({ filesChanged, stopped, maxReached, step }) => {
+    setRunning(false);
+    if (activeStream) { finalizeAssistantMessage(activeStream, { stopped }); activeStream = null; }
+    renderSummaryCard({ filesChanged, stopped, maxReached, step });
+    $('stepStrip').classList.add('hidden');
+    if (Array.isArray(filesChanged) && filesChanged.length) {
+      toast(`${filesChanged.length} file(s) updated in "${workspace.name}".`, 'ok', { title: 'Done —' });
+    }
+    syncWorkspaceStatus();
+  })
+  .on(AgentEvents.ERROR, (err) => {
+    setRunning(false);
+    if (activeStream) { finalizeAssistantMessage(activeStream, { stopped: true }); activeStream = null; }
+    $('stepStrip').classList.add('hidden');
+    const message = err && err.message ? err.message : String(err);
+    const hint = err && err.hint ? `\n\n${err.hint}` : '';
+    addSystemMessage(`**Request failed:** ${message}${hint}`, 'error');
+    if (err instanceof ApiError) showApiBanner(err);
+    else toast(message, 'err', { title: 'Request failed —' });
+  });
+
+function syncWorkspaceStatus() {
+  const node = $('wsStatus');
+  if (!node) return;
+  if (workspace.ready) node.textContent = `${workspace.name} · ${workspace.mode === 'zip' ? 'read-only' : 'read/write'}`;
+  else node.textContent = 'no folder open';
+}
+
+/* ------------------------------------------------------------------ messages */
+
+function hideEmptyState() { $('emptyState').classList.add('hidden'); }
+
+function starterPrompts() {
+  return [
+    'Create a landing page with a hero, features and pricing sections.',
+    'Build a todo app with localStorage — HTML, CSS and JS in separate files.',
+    'Scaffold a small express server with a health endpoint.'
+  ];
+}
+
+function renderStarters() {
+  const host = $('starterList');
+  host.innerHTML = '';
+  for (const s of starterPrompts()) {
+    host.append(el('button', {
+      class: 'starter', type: 'button', text: s,
+      onclick: () => { $('promptInput').value = s; autosizeInput(); $('promptInput').focus(); }
+    }));
+  }
+}
+
+function addUserMessage(text, attachments = [], contextFiles = []) {
+  hideEmptyState();
+  const body = el('div', { class: 'bubble-body' }, el('div', { html: renderMarkdown(text) }));
+  if (attachments.length) {
+    const imgs = el('div', { class: 'msg-images' });
+    for (const a of attachments) imgs.append(el('img', { src: a.dataUrl, alt: a.name || 'attachment' }));
+    body.prepend(imgs);
+  }
+  if (contextFiles.length) {
+    body.append(el('div', { class: 'msg-context', text: `context: ${contextFiles.join(', ')}` }));
+  }
+  $('messages').append(el('div', { class: 'msg user' },
+    el('div', { class: 'bubble-wrap' }, el('div', { class: 'bubble' }, body))
+  ));
+  scrollToBottom();
+}
+
+function addSystemMessage(text, kind = 'info') {
+  hideEmptyState();
+  $('messages').append(el('div', { class: 'msg system' },
+    el('div', { class: 'avatar', text: kind === 'error' ? '⚠️' : 'ℹ️' }),
+    el('div', { class: 'bubble-wrap' }, el('div', { class: 'bubble' }, el('div', { html: renderMarkdown(text) })))
+  ));
+  scrollToBottom();
+}
+
+function beginAssistantMessage() {
+  hideEmptyState();
+  const bodyEl = el('div', { class: 'bubble-body' },
+    el('div', { class: 'thinking-skeleton' }, el('i'), el('i'), el('i'))
+  );
+  const reasoningEl = el('details', { class: 'reasoning hidden' },
+    el('summary', { text: 'Reasoning' }),
+    el('div', { class: 'reasoning-body' })
+  );
+  const metaEl = el('div', { class: 'msg-meta hidden' });
+  const bubble = el('div', { class: 'bubble' }, reasoningEl, bodyEl);
+  const wrap = el('div', { class: 'bubble-wrap' }, bubble, metaEl);
+  const node = el('div', { class: 'msg assistant' }, el('div', { class: 'avatar', text: '⚡' }), wrap);
+  $('messages').append(node);
+  scrollToBottom();
+  return { node, bodyEl, reasoningEl, reasoningBody: reasoningEl.querySelector('.reasoning-body'), metaEl, text: '', reasoning: '', frame: 0 };
+}
+
+function renderStreamingBody(stream) {
+  if (stream.frame) return;
+  stream.frame = requestAnimationFrame(() => {
+    stream.frame = 0;
+    const skeleton = stream.bodyEl.querySelector('.thinking-skeleton');
+    if (skeleton) skeleton.remove();
+    stream.bodyEl.innerHTML = renderMarkdown(stream.text) + '<span class="typing-caret"></span>';
+    scrollToBottom();
+  });
+}
+
+function renderReasoningBody(stream) {
+  if (!stream.reasoning) return;
+  stream.reasoningEl.classList.remove('hidden');
+  stream.reasoningBody.textContent = stream.reasoning;
+}
+
+function finalizeAssistantMessage(stream, { stopped = false, usageText = '' } = {}) {
+  const skeleton = stream.bodyEl.querySelector('.thinking-skeleton');
+  if (skeleton) skeleton.remove();
+  const caret = stream.bodyEl.querySelector('.typing-caret');
+  if (caret) caret.remove();
+  stream.bodyEl.innerHTML = String(stream.text || '').trim()
+    ? renderMarkdown(stream.text)
+    : '<p class="muted">(no text returned)</p>';
+  stream.metaEl.classList.remove('hidden');
+  stream.metaEl.innerHTML = '';
+  if (stopped) stream.metaEl.append(el('span', { class: 'badge promo tiny', text: 'stopped' }));
+  if (usageText) stream.metaEl.append(el('span', { class: 'badge tiny', text: usageText }));
+  const actions = el('div', { class: 'op-actions' });
+  actions.append(
+    el('button', {
+      class: 'mini-btn', type: 'button', text: 'Copy',
+      onclick: async () => {
+        try { await navigator.clipboard.writeText(stream.text); toast('Message copied.', 'ok'); }
+        catch { toast('Clipboard access was blocked.', 'err'); }
+      }
+    }),
+    el('button', { class: 'mini-btn', type: 'button', text: 'Delete', onclick: () => stream.node.remove() })
+  );
+  stream.metaEl.append(actions);
+  scrollToBottom();
+}
+
+/* --------------------------------------------------------------- op cards */
+
+function diffView(diff) {
+  const box = el('div', { class: 'diff' });
+  if (!diff || !diff.length) {
+    box.append(el('div', { class: 'diff-empty', text: 'No textual changes.' }));
+    return box;
+  }
+  const hunks = toHunks(diff, 3);
+  hunks.forEach((hunk, index) => {
+    if (index > 0) box.append(el('div', { class: 'diff-hunk-sep', text: '⋯' }));
+    for (const row of hunk) {
+      const marker = row.type === 'add' ? '+' : row.type === 'del' ? '-' : ' ';
+      box.append(el('div', { class: `diff-row ${row.type}` },
+        el('div', { class: 'diff-gutter' },
+          el('span', { text: row.oldLine == null ? '' : String(row.oldLine) }),
+          el('span', { text: row.newLine == null ? '' : String(row.newLine) })),
+        el('div', { class: 'diff-code', html: highlight(marker + row.text) })
+      ));
+    }
+  });
+  return box;
+}
+
+function filePreviewView(text) {
+  const box = el('div', { class: 'diff' });
+  const body = el('div', { class: 'diff-code', style: { padding: '10px 12px', display: 'block' } });
+  body.innerHTML = String(text || '').split('\n').map((l) => highlight(l)).join('\n');
+  box.append(body);
+  return box;
+}
+
+function renderOpCard(item) {
+  const tone = item.tone || (OP_META[item.kind] || {}).tone || 'edit';
+  const icon = item.icon || (OP_META[item.kind] || {}).icon || '•';
+  const card = el('div', { class: 'op-card', dataset: { op: item.id, tone, kind: item.kind } },
+    el('div', { class: 'op-head' },
+      el('span', { class: 'op-icon', text: icon }),
+      el('span', { class: 'op-kind', text: (OP_META[item.kind] || {}).label || item.kind }),
+      el('span', { class: 'op-path mono', text: item.path || '' }),
+      el('div', { class: 'spacer' })
+    ),
+    el('div', { class: 'op-body' }),
+    el('div', { class: 'op-foot' }, el('div', { class: 'op-actions' }))
+  );
+  card._body = card.querySelector('.op-body');
+  card._actions = card.querySelector('.op-actions');
+  return card;
+}
+
+function renderOpPending(card, item) {
+  const bodyEl = card._body;
+  const actionsEl = card._actions;
+  bodyEl.innerHTML = '';
+  actionsEl.innerHTML = '';
+  if (item.kind === 'read') {
+    bodyEl.append(el('div', { class: 'op-message', text: 'The model wants to read this file before editing.' }));
+  } else if (item.kind === 'folder') {
+    bodyEl.append(el('div', { class: 'op-message', text: 'Create this folder in the workspace.' }));
+  } else if (item.kind === 'delete') {
+    bodyEl.append(el('div', { class: 'op-message err', text: 'This will delete the file (a snapshot is kept for undo).' }));
+  } else {
+    bodyEl.append(diffView(item.diff || []));
+  }
+  actionsEl.append(
+    el('button', { class: 'mini-btn ok', type: 'button', text: 'Apply', onclick: () => approveOp(item.id) }),
+    el('button', { class: 'mini-btn danger', type: 'button', text: 'Reject', onclick: () => rejectOp(item.id) })
+  );
+  if (item.autoApproved) bodyEl.prepend(el('div', { class: 'op-message muted', text: 'Auto-approved by your settings.' }));
+}
+
+function renderOpResult(card, res) {
+  const bodyEl = card._body || card.querySelector('.op-body');
+  const actionsEl = card._actions || card.querySelector('.op-actions');
+  if (!bodyEl || !actionsEl) return;
+  bodyEl.innerHTML = '';
+  actionsEl.innerHTML = '';
+  const badge = el('span', {
+    class: `badge tiny ${res.status === 'applied' ? 'free' : res.status === 'partial' ? 'promo' : ''}`,
+    text: res.status || 'done'
+  });
+  actionsEl.append(badge);
+  if (res.kind === 'folder') {
+    bodyEl.append(el('div', { class: 'op-message', text: res.message || 'Folder created.' }));
+    return;
+  }
+  if (res.kind === 'read') {
+    if (res.fileContent == null) bodyEl.append(el('div', { class: 'op-message err', text: res.message || 'File missing.' }));
+    else bodyEl.append(el('div', { class: 'op-message', text: res.message || '' }), filePreviewView(res.fileContent));
+    return;
+  }
+  if (res.status === 'rejected') { bodyEl.append(el('div', { class: 'op-message', text: res.message || 'Skipped.' })); return; }
+  if (res.status === 'failed') {
+    bodyEl.append(el('div', { class: 'op-message err', text: res.message || 'Operation failed.' }));
+    return;
+  }
+  const holder = el('div', {});
+  bodyEl.append(holder);
+  holder.append(diffView(res.diff || []));
+  const msg = el('div', { class: 'op-message' }, el('span', { text: res.message || '' }));
+  if (res.path) {
+    msg.append(el('button', { class: 'mini-btn', type: 'button', text: 'Revert', onclick: () => revertPath(res.path) }));
+  }
+  bodyEl.append(msg);
+}
+
+async function approveOp(opId) {
+  const res = await agent.approve(opId);
+  if (res) await afterOpResult(res);
+}
+
+function rejectOp(opId) {
+  const res = agent.reject(opId);
+  if (res) afterOpResult(res);
+}
+
+async function afterOpResult(res) {
+  const card = document.querySelector(`[data-op="${res.id}"]`);
+  if (card) renderOpResult(card, res);
+  refreshUndoCount();
+  scrollToBottom();
+}
+
+function renderSummaryCard({ filesChanged = [], maxReached, stopped, step }) {
+  if (!filesChanged.length && !maxReached && !stopped) return;
+  const parts = [];
+  if (filesChanged.length) parts.push(`${filesChanged.length} file${filesChanged.length === 1 ? '' : 's'} changed`);
+  if (stopped) parts.push('stopped by you');
+  if (maxReached) parts.push(`step limit reached (${step})`);
+  $('messages').append(el('div', { class: 'op-card', dataset: { tone: 'create' } },
+    el('div', { class: 'op-head' },
+      el('span', { class: 'op-icon', text: '✅' }),
+      el('span', { class: 'op-kind', text: 'Summary' }),
+      el('span', { class: 'op-path', text: parts.join(' · ') })
+    ),
+    el('div', { class: 'op-body' },
+      el('div', { class: 'op-message', text: filesChanged.length ? `Changed: ${filesChanged.join(', ')}` : 'No files were changed.' })
+    )
+  ));
+  scrollToBottom();
+}
+
+/* -------------------------------------------------------------- run prompt */
+
+async function runPrompt(prompt, { skipHistory = false } = {}) {
+  const text = String(prompt || '').trim();
+  if (!text) return;
+  if (agent.isRunning) return toast('A run is already in progress.', 'warn');
+  if (!state.activeConnection || !state.activeConnection.apiKey) {
+    openConnectionsModal({ firstRun: true });
+    toast('Add an API key to start chatting.', 'warn', { title: 'No key —' });
+    return;
+  }
+  if (!workspace.ready && getSettings().autoCreateFolder) {
+    const choice = await askFolderForPrompt(text);
+    if (choice === 'cancelled') return;
+  }
+  state.lastUserPrompt = text;
+  pushRecentPrompt(text);
+  const contextBlock = state.contextFiles.length
+    ? `\n\nFiles currently in context:\n${state.contextFiles.map((p) => `- ${p}`).join('\n')}`
+    : '';
+  const attachments = state.attachments.slice();
+  if (!skipHistory) addUserMessage(text, attachments, state.contextFiles);
+  const payloadText = text + contextBlock;
+  const content = attachments.length
+    ? [{ type: 'text', text: payloadText }, ...attachments.map((a) => ({ type: 'image_url', image_url: { url: a.dataUrl } }))]
+    : payloadText;
+  state.usage = { input: 0, output: 0 };
+  updateUsageBar(state.usage);
+  $('promptInput').value = '';
+  autosizeInput();
+  state.attachments = [];
+  renderAttachments();
+  setRunning(true);
+  await agent.send(content);
+  setRunning(false);
+  syncWorkspaceStatus();
+}
+
+/* --------------------------------------------------- "no folder" prompt flow */
+
+async function askFolderForPrompt(prompt) {
+  const baseSlug = slugifyPrompt(prompt);
+  const suggested = uniqueName(baseSlug, []);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v) => { if (!settled) { settled = true; dialog.close(); resolve(v); } };
+    const nameInput = el('input', { class: 'input', value: suggested, spellcheck: 'false' });
+    const slugPreview = el('div', { class: 'hint mono' });
+    const updatePreview = () => {
+      slugPreview.textContent = `Folder name: ${slugifyPrompt(nameInput.value || prompt)}`;
+    };
+    nameInput.addEventListener('input', updatePreview);
+    updatePreview();
+    const canPick = supportsFileSystemAccess();
+    const body = el('div', {},
+      el('p', { class: 'muted', style: { marginTop: 0 } },
+        canPick
+          ? 'No folder is open. Pick a parent folder and I will create a subfolder named after your prompt.'
+          : 'This browser cannot write files directly. You can still chat, or load a project read-only and download a .zip.'),
+      el('div', { class: 'field' },
+        el('label', { text: 'New project folder name' }),
+        nameInput,
+        slugPreview
+      )
+    );
+    const dialog = openModal({
+      title: 'Where should I write the files?',
+      sub: 'Asked once per workspace.',
+      size: 'narrow',
+      body,
+      footer: [
+        el('div', { class: 'spacer' }),
+        el('button', { class: 'btn btn-ghost', type: 'button', text: 'Just chat', onclick: () => finish('chat') }),
+        canPick
+          ? el('button', {
+            class: 'btn btn-primary', type: 'button', text: 'Choose parent & create',
+            onclick: async () => {
+              try {
+                const parent = await pickDirectory({ mode: 'readwrite' });
+                const folderName = slugifyPrompt(nameInput.value || prompt) || `${baseSlug}-${timestampSlug()}`;
+                const child = await parent.getDirectoryHandle(folderName, { create: true });
+                workspace.root = child;
+                workspace.name = folderName;
+                workspace.mode = 'fsa';
+                workspace.ready = true;
+                await saveRootHandle(child);
+                await refreshWorkspaceUI();
+                toast(`Created folder "${folderName}".`, 'ok', { title: 'Workspace ready —' });
+                finish('ready');
+              } catch (e) {
+                if (e && (e.code === 'cancelled' || e.name === 'AbortError')) return;
+                toast(e.message || 'Could not create the folder.', 'err');
+              }
+            }
+          })
+          : null
+      ].filter(Boolean),
+      onClose: () => { if (!settled) { settled = true; resolve('cancelled'); } }
+    });
+  });
+}
+
+/* --------------------------------------------------------------- explorer */
+
+async function renderTree() {
+  const host = $('treeRoot');
+  if (!host) return;
+  host.innerHTML = '';
+  if (!workspace.ready) {
+    host.append(el('div', { class: 'tree-empty' },
+      el('div', { text: '📂' }),
+      el('div', { style: { marginTop: '8px' }, text: 'No folder is open.' })
+    ));
+    return;
+  }
+  let nodes = [];
+  if (workspace.mode === 'zip') nodes = buildZipTree();
+  else nodes = await buildTree(workspace.root, { patterns: workspace.ignorePatterns, maxDepth: 3, maxEntries: 900 });
+  const filter = ($('sidebarSearch').value || '').trim().toLowerCase();
+  const rendered = filter ? pruneTree(nodes, filter) : nodes;
+  if (!rendered.length) {
+    host.append(el('div', { class: 'tree-empty', text: filter ? 'No files match your filter.' : 'This folder is empty.' }));
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const node of rendered) frag.append(renderTreeNode(node, 0));
+  host.append(frag);
+}
+
+function pruneTree(nodes, filter) {
+  const out = [];
+  for (const node of nodes) {
+    if (node.kind === 'directory') {
+      const kids = node.children ? pruneTree(node.children, filter) : [];
+      if (kids.length) out.push({ ...node, children: kids });
+      else if (node.name.toLowerCase().includes(filter)) out.push({ ...node, children: [] });
+    } else if (node.path.toLowerCase().includes(filter)) {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
+function renderTreeNode(node, depth) {
+  const icon = kindIcon(node.path, node.kind);
+  const isDir = node.kind === 'directory';
+  const expanded = state.treeExpanded.has(node.path) || depth < 1;
+  const btn = el('button', { class: 'tree-node', type: 'button', title: node.path },
+    el('span', { class: 'twisty', text: isDir ? (expanded ? '▾' : '▸') : '' }),
+    el('span', { class: `fkind-icon ${icon.cls}`, text: isDir ? '📁' : icon.glyph }),
+    el('span', { class: 'fname', text: node.name }),
+    !isDir ? el('span', { class: 'fkind', text: extname(node.path) || 'file' }) : null
+  );
+  const wrap = el('div', {}, btn);
+  btn.addEventListener('click', async () => {
+    if (isDir) {
+      if (state.treeExpanded.has(node.path)) state.treeExpanded.delete(node.path);
+      else state.treeExpanded.add(node.path);
+      await renderTree();
+    } else {
+      document.querySelectorAll('.tree-node.is-active').forEach((n) => n.classList.remove('is-active'));
+      btn.classList.add('is-active');
+      await openPreview(node.path);
+    }
+  });
+  if (isDir && expanded && node.children && node.children.length) {
+    const box = el('div', { class: 'tree-children' });
+    for (const child of node.children) box.append(renderTreeNode(child, depth + 1));
+    wrap.append(box);
+  }
+  return wrap;
+}
+
+function buildZipTree() {
+  const files = workspace.zipFiles.map((f) => f.path);
+  const root = { children: new Map() };
+  for (const path of files) {
+    const parts = normalizePath(path).split('/').filter(Boolean);
+    let cursor = root;
+    parts.forEach((part, i) => {
+      if (!cursor.children.has(part)) cursor.children.set(part, { children: new Map(), path: parts.slice(0, i + 1).join('/') });
+      cursor = cursor.children.get(part);
+    });
+  }
+  const walk = (node) => {
+    const out = [];
+    for (const [name, child] of node.children) {
+      if (child.children.size) out.push({ name, kind: 'directory', path: child.path, children: walk(child) });
+      else out.push({ name, kind: 'file', path: child.path });
+    }
+    return out.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'directory' ? -1 : 1));
+  };
+  return walk(root);
+}
+
+/* --------------------------------------------------------------- preview */
+
+async function openPreview(path) {
+  try {
+    const text = await workspace.readText(path);
+    document.querySelector('.layout').classList.add('has-preview');
+    $('previewDrawer').classList.remove('hidden');
+    $('previewTitle').textContent = path;
+    $('previewBody').innerHTML = text.split('\n').map((l) => highlight(l)).join('\n');
+    state.currentPreview = path;
+  } catch (e) {
+    toast(`Could not open ${path}: ${e.message}`, 'err');
+  }
+}
+
+function closePreview() {
+  document.querySelector('.layout').classList.remove('has-preview');
+  $('previewDrawer').classList.add('hidden');
+  state.currentPreview = null;
+}
+
+/* ------------------------------------------------------- workspace actions */
+
+async function refreshWorkspaceUI() {
+  $('folderChipName').textContent = workspace.ready ? workspace.name : 'No folder open';
+  $('folderChipPerm').textContent = workspace.ready ? (workspace.mode === 'zip' ? 'read-only' : 'read/write') : '';
+  $('btn-open-folder-side').classList.toggle('hidden', workspace.ready);
+  $('zipBar').classList.toggle('hidden', workspace.mode !== 'zip');
+  $('zipBarLabel').textContent = workspace.mode === 'zip' ? `Read-only: ${workspace.name} (${workspace.zipFiles.length} files)` : '';
+  syncWorkspaceStatus();
+  await renderTree();
+}
+
+async function openWorkspaceFolder() {
+  try {
+    const handle = await pickDirectory({ mode: 'readwrite' });
+    workspace.root = handle;
+    workspace.name = handle.name || 'workspace';
+    workspace.mode = 'fsa';
+    workspace.ready = true;
+    await saveRootHandle(handle);
+    state.treeExpanded = new Set();
+    await refreshWorkspaceUI();
+    toast(`Opened "${workspace.name}".`, 'ok', { title: 'Workspace ready —' });
+  } catch (e) {
+    if (e && (e.code === 'cancelled' || e.name === 'AbortError')) return;
+    toast(e.message || 'Could not open the folder.', 'err');
+  }
+}
+
+async function openZipMode() {
+  const input = el('input', { type: 'file', webkitdirectory: '', multiple: true });
+  input.style.display = 'none';
+  document.body.append(input);
+  const picked = await new Promise((resolve) => {
+    input.addEventListener('change', () => resolve(input.files), { once: true });
+    input.click();
+    setTimeout(() => resolve(input.files), 60000);
+  });
+  input.remove();
+  if (!picked || !picked.length) return;
+  const files = await readFromFileList(picked, { patterns: workspace.ignorePatterns });
+  if (!files.length) return toast('No readable text files were found in that folder.', 'warn');
+  await zipModeStore.clear();
+  for (const f of files) await zipModeStore.save(f.path, f.text);
+  workspace.zipFiles = files;
+  workspace.mode = 'zip';
+  workspace.ready = true;
+  workspace.name = (picked[0].webkitRelativePath || 'project').split('/')[0];
+  workspace.overlay = new Map();
+  state.treeExpanded = new Set();
+  await refreshWorkspaceUI();
+  toast(`Loaded ${files.length} files read-only. Use Download .zip to export changes.`, 'ok');
+}
+
+async function downloadZip() {
+  const zip = new SimpleZip();
+  const seen = new Set();
+  for (const f of workspace.zipFiles) {
+    if (workspace.overlay.has(f.path)) continue;
+    zip.addFile(f.path, f.text);
+    seen.add(f.path);
+  }
+  for (const [path, text] of workspace.overlay) {
+    if (text == null || seen.has(path)) continue;
+    zip.addFile(path, text);
+    seen.add(path);
+  }
+  const blob = zip.toBlob();
+  const a = el('a', { href: URL.createObjectURL(blob), download: `${workspace.name || 'project'}.zip` });
+  document.body.append(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+  toast(`Downloaded ${(blob.size / 1024).toFixed(1)} KB .zip`, 'ok');
+}
+
+async function forgetWorkspace() {
+  const ok = await confirmDialog({ title: 'Close workspace?', message: 'The folder stays on disk; this app just forgets the handle.', confirmText: 'Close workspace' });
+  if (!ok) return;
+  workspace.ready = false;
+  workspace.root = null;
+  workspace.name = '';
+  workspace.mode = 'none';
+  workspace.zipFiles = [];
+  workspace.overlay = new Map();
+  await forgetRootHandle();
+  closePreview();
+  await refreshWorkspaceUI();
+}
+
+/* ------------------------------------------------------------------ undo */
+
+async function refreshUndoCount() {
+  try {
+    const all = await undoStore.all();
+    const counter = $('undoCount');
+    if (counter) counter.textContent = String(all.length);
+  } catch { /* ignore */ }
+}
+
+async function revertPath(path) {
+  const entries = await undoStore.all();
+  const entry = entries.slice().reverse().find((e) => e.path === normalizePath(path));
+  if (!entry) return toast('No snapshot found for this file.', 'warn');
+  try {
+    await workspace.writeText(entry.path, entry.text);
+    await undoStore.remove(entry.id);
+    await refreshUndoCount();
+    await workspace.refresh();
+    toast(`Restored ${entry.path}.`, 'ok');
+  } catch (e) {
+    toast(`Could not restore: ${e.message}`, 'err');
+  }
+}
+
+async function openUndoPanel() {
+  const all = (await undoStore.all()).slice().reverse();
+  const list = el('div', { class: 'conn-list' });
+  const rerender = () => {
+    list.innerHTML = '';
+    if (!all.length) list.append(el('div', { class: 'muted', text: 'No snapshots yet — they appear after the first edit.' }));
+    for (const entry of all) {
+      list.append(el('div', { class: 'conn-row' },
+        el('div', { class: 'conn-main' },
+          el('div', { class: 'conn-name mono', text: entry.path }),
+          el('div', { class: 'conn-sub muted', text: `${entry.reason || 'edit'} · ${new Date(entry.at).toLocaleTimeString()}` })
+        ),
+        el('button', {
+          class: 'mini-btn', type: 'button', text: 'Restore',
+          onclick: async () => {
+            try {
+              await workspace.writeText(entry.path, entry.text);
+              await undoStore.remove(entry.id);
+              await refreshUndoCount();
+              await workspace.refresh();
+              toast(`Restored ${entry.path}.`, 'ok');
+              panel.close();
+            } catch (e) { toast(e.message, 'err'); }
+          }
+        })
+      ));
+    }
+  };
+  rerender();
+  const panel = openModal({
+    title: 'Undo history',
+    sub: 'Snapshots of files before they were changed.',
+    body: list,
+    footer: [
+      el('button', {
+        class: 'btn btn-ghost', type: 'button', text: 'Clear history',
+        onclick: async () => { await undoStore.clear(); await refreshUndoCount(); all.length = 0; rerender(); }
+      }),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn btn-primary', type: 'button', text: 'Done', onclick: () => panel.close() })
+    ]
+  });
+}
+
+/* ------------------------------------------------------------- connections */
+
+function refreshConnections() {
+  state.connections = getConnections();
+  state.activeConnection = getActiveConnection();
+}
+
+function openConnectionsModal({ firstRun = false } = {}) {
+  const listRoot = el('div', { class: 'conn-list' });
+  const keyArea = el('textarea', { class: 'input mono', rows: '3' });
+  keyArea.placeholder = 'Paste one key, or several — one per line…';
+  const rerender = () => {
+    listRoot.innerHTML = '';
+    renderConnectionRows(listRoot);
+    renderActiveConnectionCard();
+  };
+  const addBtn = el('button', { class: 'btn btn-primary', type: 'button', text: 'Add key(s)' });
+  addBtn.addEventListener('click', async () => {
+    const lines = keyArea.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (!lines.length) return toast('Paste at least one key first.', 'warn');
+    let added = 0;
+    for (const line of lines) {
+      const clean = normalizeApiKey(line);
+      if (!clean) continue;
+      const preset = detectProvider(clean);
+      const fallback = (state.catalogByProvider[preset.id] || [])[0];
+      const conn = makeConnection({
+        providerId: preset.id,
+        name: `${preset.name} ${maskApiKey(clean)}`,
+        baseUrl: preset.baseUrl,
+        apiStyle: preset.apiStyle,
+        apiKey: clean,
+        defaultModel: fallback ? fallback.id : ''
+      });
+      upsertConnection(conn);
+      added += 1;
+    }
+    keyArea.value = '';
+    refreshConnections();
+    rerender();
+    refreshCatalog({ silent: true });
+    toast(`Added ${added} connection${added === 1 ? '' : 's'}.`, 'ok');
+  });
+  const exportBtn = el('button', { class: 'btn btn-ghost', type: 'button', text: 'Copy JSON' });
+  exportBtn.addEventListener('click', async () => {
+    const data = JSON.stringify(state.connections.map((c) => ({ ...c, apiKey: '' })), null, 2);
+    try { await navigator.clipboard.writeText(data); toast('Connections copied (keys excluded).', 'ok'); }
+    catch { toast('Clipboard blocked.', 'err'); }
+  });
+  const body = el('div', {},
+    firstRun ? el('p', { class: 'muted', style: { marginTop: 0 }, text: 'Paste any provider key. The provider is detected from the key format.' }) : null,
+    el('div', { class: 'field' },
+      el('label', { text: 'Add API key(s)' }),
+      keyArea,
+      el('div', { class: 'hint', text: 'TokenHarbor · BazaarLink · Anthropic · OpenRouter · OpenAI · Groq · xAI · Gemini.' })),
+    el('div', { class: 'row-flex' }, addBtn, el('div', { class: 'spacer' }), exportBtn),
+    el('div', { class: 'field' }, el('label', { text: 'Connections' }), listRoot)
+  );
+  const panel = openModal({ title: 'Connections', sub: 'Keys never leave your browser except to the provider.', size: 'wide', body });
+  renderConnectionRows(listRoot);
+  return panel;
+}
+
+function renderConnectionRows(host) {
+  host.innerHTML = '';
+  if (!state.connections.length) {
+    host.append(el('div', { class: 'muted', text: 'No connections yet.' }));
+    return;
+  }
+  for (const conn of state.connections) {
+    const preset = detectProvider(conn.apiKey, conn.baseUrl);
+    const isActive = state.activeConnection && state.activeConnection.id === conn.id;
+    const row = el('div', { class: `conn-row${isActive ? ' is-active' : ''}` },
+      el('div', { class: 'conn-main' },
+        el('div', { class: 'conn-name', text: conn.name || preset.name }),
+        el('div', { class: 'conn-sub' },
+          el('span', { class: 'badge provider', text: preset.name }),
+          el('span', { class: 'mono muted', text: maskApiKey(conn.apiKey) })
+        ),
+        el('div', { class: 'conn-sub muted mono', text: conn.baseUrl || '' })
+      ),
+      el('div', { class: 'conn-actions' })
+    );
+    const actions = row.querySelector('.conn-actions');
+    if (isActive) actions.append(el('span', { class: 'badge free tiny', text: 'ACTIVE' }));
+    else {
+      const setBtn = el('button', { class: 'mini-btn', type: 'button', text: 'Set active' });
+      setBtn.addEventListener('click', async () => {
+        saveSettings({ activeConnectionId: conn.id });
+        refreshConnections();
+        renderActiveConnectionCard();
+        await refreshCatalog({ silent: true });
+        renderConnectionRows(host);
+      });
+      actions.append(setBtn);
+    }
+    const testBtn = el('button', { class: 'mini-btn', type: 'button', text: 'Test' });
+    testBtn.addEventListener('click', async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        const res = await testConnection({ connection: conn, model: conn.defaultModel || state.model });
+        toast(`OK, ${res.latencyMs} ms`, 'ok', { title: 'Connection works —' });
+      } catch (err) {
+        toast(err.message || 'Test failed.', 'err', { title: 'Connection failed —' });
+      } finally { e.currentTarget.disabled = false; }
+    });
+    const delBtn = el('button', { class: 'mini-btn danger', type: 'button', text: 'Remove' });
+    delBtn.addEventListener('click', async () => {
+      const ok = await confirmDialog({ title: 'Remove connection?', message: conn.name || conn.id, confirmText: 'Remove', danger: true });
+      if (!ok) return;
+      deleteConnection(conn.id);
+      refreshConnections();
+      renderConnectionRows(host);
+      renderActiveConnectionCard();
+    });
+    actions.append(testBtn, delBtn);
+    host.append(row);
+  }
+}
+
+function renderActiveConnectionCard() {
+  const box = $('activeConn');
+  box.innerHTML = '';
+  if (!state.activeConnection) return box.append(el('span', { class: 'muted', text: 'No connection — add a key.' }));
+  const preset = detectProvider(state.activeConnection.apiKey, state.activeConnection.baseUrl);
+  box.append(
+    el('span', { class: 'badge provider', text: preset.name }),
+    el('span', { class: 'mono', text: maskApiKey(state.activeConnection.apiKey) })
+  );
+}
+
+/* ---------------------------------------------------------- connections */
+
+function refreshConnections() {
+  state.connections = getConnections();
+  const settings = getSettings();
+  state.activeConnection = state.connections.find((c) => c.id === settings.activeConnectionId) || state.connections[0] || null;
+}
+
+function friendlyProviderName(conn) {
+  return (PROVIDER_PRESETS.find((p) => p.id === conn.providerId) || {}).name || conn.providerId || 'Custom';
+}
+
+function updateConnectionPill() {
+  const conn = state.activeConnection;
+  $('connPillName').textContent = conn ? (conn.name || 'Connection') : 'No connection';
+  $('connPillKey').textContent = conn ? maskApiKey(conn.apiKey) : 'add a key';
+  updateModelPill();
+}
+
+function updateUsageBar(usage) {
+  const model = currentModel();
+  const price = model ? priceLabel(model) : '';
+  $('usageText').textContent = `${(usage.input || 0).toLocaleString()} in · ${(usage.output || 0).toLocaleString()} out${price ? ` · ${price}` : ''}${state.cacheLayer ? ` · cache ${escapeHtml(state.cacheLayer)}` : ''}`;
+}
+
+function showApiBanner(err) {
+  if (err.status === 401) banner('api', { kind: 'error', title: 'Invalid or revoked API key. ', message: err.message, hint: err.hint });
+  else if (err.code === 'email_verification_required') banner('api', { kind: 'error', title: 'Email not verified. ', message: err.message, hint: err.hint });
+  else if (err.status === 402) banner('api', { kind: 'warn', title: 'Not enough credits. ', message: err.message, hint: err.hint });
+  else if (err.code === 'model_not_found' || err.code === 'model_not_supported') banner('api', { kind: 'warn', title: 'Unknown model. ', message: err.message, hint: err.hint });
+  else if (err.status === 429) banner('api', { kind: 'warn', title: 'Rate limited. ', message: err.message, hint: err.hint });
+  else if (err.status === 403) banner('api', { kind: 'error', title: 'Request refused. ', message: err.message, hint: err.hint });
+  else banner('api', { kind: 'error', title: 'Request failed. ', message: err.message || String(err), hint: err.hint || '' });
+}
+
+/* -------------------------------------------------------- model catalog */
+
+function currentModel() {
+  return state.catalog.find((m) => m.id === state.model) || null;
+}
+
+function setModel(id, source = '') {
+  const conn = state.activeConnection;
+  if (conn) {
+    conn.model = id;
+    upsertConnection(conn);
+  }
+  state.model = id;
+  pushRecentModel(id);
+  state.recents = getRecents();
+  updateModelPill();
+  if (source === 'picker') toast(`Model: ${id}`, 'info', { timeout: 2400 });
+}
+
+function updateModelPill() {
+  const model = currentModel();
+  $('modelPillName').textContent = model ? model.label : (state.model || 'Select a model');
+  $('modelPillMeta').textContent = model ? `${model.id}${model.isFree ? ' · free' : ''}` : 'custom id';
+}
+
+function catalogForActiveConnection() {
+  const conn = state.activeConnection;
+  if (!conn) return [];
+  const key = conn.providerId || 'custom';
+  if (state.catalogByProvider[key] && state.catalogByProvider[key].length) return state.catalogByProvider[key];
+  return DEFAULT_CATALOG[key] || DEFAULT_CATALOG.tokenharbor;
+}
+
+async function refreshCatalog({ silent = false } = {}) {
+  state.catalog = catalogForActiveConnection();
+  updateModelPill();
+  updateUsageBar(state.usage);
+  const conn = state.activeConnection;
+  if (!conn) { state.catalogLive = false; return; }
+  try {
+    const live = await listModels(conn);
+    if (live && live.length) {
+      state.catalog = live;
+      state.catalogByProvider[conn.providerId || 'custom'] = live;
+      state.catalogLive = true;
+      state.catalogUpdatedAt = Date.now();
+      if (!live.some((m) => m.id === state.model)) {
+        const free = live.find((m) => m.isFree);
+        if (free) setModel(free.id);
+        else if (live[0]) setModel(live[0].id);
+      }
+      updateModelPill();
+      updateUsageBar(state.usage);
+    }
+  } catch (e) {
+    state.catalogLive = false;
+    if (!silent) toast(`Model list refresh failed (${e.status || 'network'}): ${e.message}`, 'warn');
+  }
+}
+
+/* ------------------------------------------------------------ model picker */
+
+function openModelPicker() {
+  const search = el('input', { class: 'input', placeholder: 'Search models, families, ids…', spellcheck: 'false' });
+  const toolbar = el('div', { class: 'picker-toolbar' });
+  const customRow = el('div', { class: 'picker-custom' });
+  const list = el('div', { class: 'picker-list' });
+  search.addEventListener('input', () => renderPicker({ query: search.value, freeOnly, list }));
+  let freeOnly = false;
+  const freeBtn = el('button', {
+    class: 'mini-btn', type: 'button', text: '🆓 Free only',
+    onclick: () => {
+      freeOnly = !freeOnly;
+      freeBtn.classList.toggle('ok', freeOnly);
+      renderPicker({ query: search.value, freeOnly, list });
+    }
+  });
+  toolbar.append(
+    freeBtn,
+    el('button', {
+      class: 'mini-btn', type: 'button', text: '⟳ Refresh',
+      onclick: async () => {
+        freeBtn.disabled = true;
+        await refreshCatalog();
+        freeBtn.disabled = false;
+        renderPicker({ query: search.value, freeOnly, list });
+      }
+    }),
+    el('span', { class: 'hint', text: state.catalogLive ? 'live catalog' : 'built-in catalog' })
+  );
+  const customInput = el('input', { class: 'input', placeholder: 'Custom model id, e.g. deepseek-v4.1-flash', spellcheck: 'false', value: state.model || '' });
+  customRow.append(
+    customInput,
+    el('button', {
+      class: 'btn btn-primary', type: 'button', text: 'Use',
+      onclick: () => { setModel(customInput.value.trim() || state.model, 'picker'); picker.close(); }
+    })
+  );
+  const body = el('div', {},
+    el('div', { class: 'field' }, search),
+    toolbar,
+    list,
+    el('div', { class: 'field', style: { marginTop: '12px' } },
+      el('label', { text: 'Use a custom model id' }),
+      customRow
+    )
+  );
+  const picker = openModal({ title: 'Select a model', sub: friendlyProviderName(state.activeConnection), body, size: 'wide' });
+  renderPicker({ query: '', freeOnly: false, list });
+  setTimeout(() => search.focus(), 60);
+
+  function renderPicker({ query = '', freeOnly = false, list: host }) {
+    host.innerHTML = '';
+    const filtered = filterModels(state.catalog, { query, freeOnly, favourites: state.favourites, recents: state.recents.models });
+    if (!filtered.length) {
+      host.append(el('div', { class: 'muted', text: 'No models match. Try a different search, or use a custom id below.' }));
+      return;
+    }
+    const groups = groupModels(filtered);
+    for (const group of groups) {
+      host.append(el('div', { class: 'picker-group', text: group.title }));
+      for (const m of group.items) {
+        const isFav = state.favourites.includes(m.id);
+        const active = m.id === state.model;
+        const row = el('button', { class: 'picker-row', type: 'button', dataset: { active: active ? '1' : '' } },
+          el('span', { class: 'picker-glyph', text: familyGlyph(m.family) }),
+          el('span', { class: 'picker-main' },
+            el('span', { class: 'picker-name', text: m.label }),
+            el('span', { class: 'picker-id mono', text: m.id })
+          ),
+          el('span', { class: 'picker-badges' },
+            m.isFree ? el('span', { class: 'badge free tiny', text: 'FREE' }) : null,
+            m.freeUntil ? el('span', { class: 'badge promo tiny', text: `free until ${m.freeUntil.slice(0, 10)}` }) : null,
+            m.limited ? el('span', { class: 'badge tiny', text: 'LIMITED' }) : null,
+            el('span', { class: 'badge tiny', text: priceLabel(m) })
+          ),
+          el('span', { class: 'picker-meta', text: `${(m.family || '').toUpperCase()} · ${formatContext(m.contextLength)}` })
+        );
+        const favBtn = el('button', {
+          class: 'mini-btn', type: 'button', text: isFav ? '★' : '☆', title: 'Favourite',
+          onclick: (e) => {
+            e.stopPropagation();
+            const i = state.favourites.indexOf(m.id);
+            if (i >= 0) state.favourites.splice(i, 1);
+            else state.favourites.push(m.id);
+            saveSettings({ favourites: state.favourites });
+            renderPicker({ query, freeOnly, list: host });
+          }
+        });
+        row.prepend(favBtn);
+        row.addEventListener('click', () => { setModel(m.id, 'picker'); picker.close(); });
+        row.addEventListener('dblclick', () => { setModel(m.id, 'picker'); picker.close(); });
+        host.append(row);
+      }
+    }
+    const guess = query && !filtered.some((m) => m.id === query.trim()) ? suggestModel(query.trim(), state.catalog) : null;
+    if (guess) {
+      host.append(el('button', {
+        class: 'picker-row', type: 'button',
+        onclick: () => { setModel(guess, 'picker'); picker.close(); }
+      }, el('span', { class: 'picker-main' }, el('span', { class: 'picker-name', text: `Did you mean ${guess}?` }))));
+    }
+  }
+}
+
+/* ----------------------------------------------------------- model picker */
+
+function activeCatalog() {
+  return state.catalog.length ? state.catalog : (DEFAULT_CATALOG[state.activeConnection.provider] || DEFAULT_CATALOG.tokenharbor);
+}
+
+function currentModel() {
+  return activeCatalog().find((m) => m.id === state.model) || null;
+}
+
+function setModel(id, { persist = true } = {}) {
+  state.model = id;
+  pushRecentModel(id);
+  if (state.activeConnection) {
+    state.activeConnection.model = id;
+    upsertConnection(state.activeConnection);
+    state.connections = getConnections();
+  }
+  updateModelPill();
+}
+
+function updateModelPill() {
+  const model = currentModel();
+  const label = model ? model.label : (state.model || 'Select model');
+  $('modelPillLabel').textContent = label;
+  $('modelPillId').textContent = state.model || '';
+  $('modelPillFree').classList.toggle('hidden', !(model && model.isFree));
+  $('priceLine').textContent = model ? `💲 ${priceLabel(model)}${model.contextLength ? ` · ${formatContext(model.contextLength)}` : ''}` : '';
+  $('capLine').textContent = model && model.modalities && model.modalities.length ? `🧩 ${model.modalities.join(' · ')}` : '';
+}
+
+/* eslint-disable no-await-in-loop */
+async function refreshCatalog({ silent = false } = {}) {
+  if (!state.activeConnection || !state.activeConnection.apiKey) return;
+  try {
+    const live = await listModels(state.activeConnection);
+    if (live.length) {
+      state.catalog = live;
+      state.catalogByProvider[state.activeConnection.provider] = live;
+      state.catalogLive = true;
+      state.catalogUpdatedAt = Date.now();
+      if (!live.some((m) => m.id === state.model)) {
+        const free = live.find((m) => m.isFree);
+        if (free) setModel(free.id);
+      }
+      renderCatalogMeta();
+      updateModelPill();
+    }
+  } catch (e) {
+    if (!silent) toast(`Model list failed: ${e.message}`, 'warn');
+  }
+}
+
+function renderCatalogMeta() {
+  const meta = $('catalogMeta');
+  if (!meta) return;
+  if (state.catalogLive) meta.textContent = ` · ${state.catalog.length} models · live ${new Date(state.catalogUpdatedAt).toLocaleTimeString()}`;
+  else meta.textContent = ` · ${activeCatalog().length} models · bundled catalog`;
+}
+
+function openModelPicker() {
+  const options = { freeOnly: false, query: '' };
+  const search = el('input', { class: 'input', placeholder: 'Search models… (label, id, family)', autocomplete: 'off' });
+  const freeToggle = el('button', { class: 'chip', type: 'button', text: '🆓 Free only' });
+  const refreshBtn = el('button', { class: 'mini-btn', type: 'button', text: '⟳ Refresh' });
+  const customWrap = el('div', { class: 'custom-model' });
+  const customInput = el('input', { class: 'input mono', placeholder: 'Or use a custom model id…', spellcheck: 'false' });
+  customWrap.append(customInput, el('button', { class: 'btn btn-ghost', type: 'button', text: 'Use', onclick: () => {
+    const id = String(customInput.value || '').trim();
+    if (!id) return;
+    setModel(id);
+    picker.close();
+    toast(`Using custom model "${id}".`, 'ok');
+  } }));
+  const listHost = el('div', { class: 'model-list' });
+
+  const draw = () => {
+    freeToggle.classList.toggle('is-active', options.freeOnly);
+    options.query = search.value;
+    const rows = filterModels(activeCatalog(), {
+      query: options.query,
+      freeOnly: options.freeOnly,
+      favourites: state.favourites,
+      recents: getRecents().models
+    });
+    listHost.innerHTML = '';
+    if (!rows.length) {
+      listHost.append(el('div', { class: 'muted', style: { padding: '12px' }, text: 'No models match.' }));
+      return;
+    }
+    let activeIdx = 0;
+    const buttons = [];
+    for (const group of groupModels(rows)) {
+      if (rows.length > 6) listHost.append(el('div', { class: 'model-group', text: group.title }));
+      for (const m of group.items) {
+        const fav = state.favourites.includes(m.id);
+        const row = el('button', { class: 'model-row', type: 'button' },
+          el('span', { class: 'mrow-glyph', text: familyGlyph(m.family) }),
+          el('span', { class: 'mrow-main' },
+            el('span', { class: 'mrow-name' }, m.label, m.isFree ? el('span', { class: 'badge free tiny', text: 'FREE' }) : null),
+            el('span', { class: 'mrow-id mono', text: m.id }),
+            m.description ? el('span', { class: 'mrow-desc', text: m.description }) : null
+          ),
+          el('span', { class: 'mrow-price', text: priceLabel(m) }),
+          el('span', { class: 'mrow-meta', text: m.contextLength ? formatContext(m.contextLength) : '' }),
+          el('button', {
+            class: `mini-btn star${fav ? ' on' : ''}`, type: 'button', text: fav ? '★' : '☆', title: 'Favourite',
+            onclick: (ev) => { ev.stopPropagation(); toggleFavourite(m.id); draw(); }
+          })
+        );
+        if (m.id === state.model) row.classList.add('is-active');
+        row.addEventListener('click', () => { setModel(m.id); picker.close(); });
+        row.addEventListener('mousemove', () => { activeIdx = buttons.length; });
+        buttons.push(row);
+        listHost.append(row);
+      }
+    }
+    listHost._buttons = buttons;
+    listHost._active = activeIdx;
+  };
+
+  search.addEventListener('input', draw);
+  freeToggle.addEventListener('click', () => { options.freeOnly = !options.freeOnly; draw(); });
+  refreshBtn.addEventListener('click', async () => { await refreshCatalog(); draw(); });
+  search.addEventListener('keydown', (e) => {
+    const buttons = listHost._buttons || [];
+    if (e.key === 'Enter' && buttons.length) {
+      const pick = buttons[Math.min(listHost._active || 0, buttons.length - 1)];
+      if (pick) pick.click();
+    }
+  });
+
+  draw();
+  const picker = openModal({
+    title: 'Select model',
+    sub: `${state.activeConnection.providerName} · ${state.catalogLive ? 'live catalog' : 'bundled catalog'}`,
+    size: 'wide',
+    body: el('div', { class: 'model-picker' },
+      el('div', { class: 'model-picker-bar' }, search, freeToggle, refreshBtn),
+      listHost,
+      customWrap
+    )
+  });
+  setTimeout(() => search.focus(), 30);
+}
+
+function toggleFavourite(id) {
+  const i = state.favourites.indexOf(id);
+  if (i >= 0) state.favourites.splice(i, 1);
+  else state.favourites.push(id);
+  saveSettings({ favourites: state.favourites });
+}
+
+/* -------------------------------------------------------- connections UI */
+
+function setActiveConnection(id) {
+  const conn = state.connections.find((c) => c.id === id) || state.connections[0];
+  if (!conn) return;
+  state.activeConnection = conn;
+  saveSettings({ activeConnectionId: conn.id });
+  state.catalog = state.catalogByProvider[conn.provider] || [];
+  state.catalogLive = false;
+  renderConnChip();
+  if (conn.model) setModel(conn.model, { persist: false });
+  updateModelPill();
+  renderCatalogMeta();
+  refreshCatalog({ silent: true });
+}
+
+function renderConnChip() {
+  const conn = state.activeConnection;
+  if (!conn) return;
+  $('connChipName').textContent = conn.name || conn.providerName || 'Connection';
+  $('connChipKey').textContent = maskApiKey(conn.apiKey);
+}
+
+let modal = null;
+
+function connectionRow(conn) {
+  const active = state.activeConnection && state.activeConnection.id === conn.id;
+  const nameEl = el('div', { class: 'conn-name', text: conn.name });
+  const subEl = el('div', { class: 'conn-sub muted' },
+    el('span', { class: 'badge tiny', text: conn.providerName }),
+    el('span', { class: 'mono conn-key', text: maskApiKey(conn.apiKey) }));
+  const statusEl = el('div', { class: 'conn-test muted', text: conn.model || '' });
+  return el('div', { class: `conn-row${active ? ' is-active' : ''}` },
+    el('div', { class: 'conn-main' }, nameEl, subEl, statusEl),
+    el('div', { class: 'conn-actions' },
+      el('button', { class: 'mini-btn', type: 'button', text: 'Test',
+        onclick: async () => {
+          statusEl.textContent = 'testing…';
+          try {
+            const out = await testConnection({ connection: conn, model: conn.model || state.model });
+            statusEl.textContent = `OK · ${out.latencyMs} ms · "${out.reply}"`;
+            toast(`${conn.name}: connection works.`, 'ok');
+          } catch (e) { statusEl.textContent = e.message; showApiBanner(e); }
+        }}),
+      el('button', { class: `mini-btn${active ? ' ok' : ''}`, type: 'button', text: active ? 'Active ✓' : 'Use',
+        onclick: () => { setActiveConnection(conn.id); if (modal && modal.refresh) modal.refresh(); }}),
+      el('button', { class: 'mini-btn', type: 'button', text: 'Edit',
+        onclick: () => openConnectionEditor(conn.id) }),
+      el('button', { class: 'mini-btn danger', type: 'button', text: 'Delete',
+        onclick: async () => {
+          if (state.connections.length <= 1) return toast('Keep at least one connection.', 'warn');
+          const ok = await confirmDialog({ title: 'Delete connection?',
+            message: `Remove "${conn.name}" from this device?`, confirmText: 'Delete', danger: true });
+          if (!ok) return;
+          deleteConnection(conn.id);
+          state.connections = getConnections();
+          if (state.activeConnection.id === conn.id) setActiveConnection(state.connections[0].id);
+          if (modal && modal.refresh) modal.refresh();
+        }})
+    ));
+}
+
+function openConnectionEditor(connId = null) {
+  const existing = connId ? state.connections.find((c) => c.id === connId) : null;
+  const nameInput = el('input', { class: 'input', value: existing ? existing.name : '', placeholder: 'e.g. My TokenHarbor key' });
+  const keyInput = el('input', { class: 'input mono', value: existing ? existing.apiKey : '', placeholder: 'Paste any API key', spellcheck: 'false', autocomplete: 'off' });
+  const detectEl = el('div', { class: 'hint' });
+  const baseInput = el('input', { class: 'input mono', value: existing ? existing.baseUrl : '', spellcheck: 'false' });
+  const styleSelect = el('select', { class: 'input' },
+    el('option', { value: 'openai', text: 'OpenAI-compatible (/chat/completions)' }),
+    el('option', { value: 'anthropic', text: 'Anthropic-style (/messages)' }));
+  styleSelect.value = existing ? existing.apiStyle : 'openai';
+  const probe0 = detectProvider(keyInput.value, baseInput.value);
+  if (!existing) { baseInput.value = baseInput.value || probe0.baseUrl; styleSelect.value = probe0.apiStyle; }
+  const refreshDetect = () => {
+    const probe = detectProvider(keyInput.value, baseInput.value);
+    detectEl.textContent = keyInput.value.trim() ? `Detected: ${probe.name}` : 'Paste a key to auto-detect its provider.';
+    return probe;
+  };
+  refreshDetect();
+  keyInput.addEventListener('input', refreshDetect);
+  const save = () => {
+    const rawKey = normalizeApiKey(keyInput.value);
+    if (!rawKey) return toast('Paste an API key first.', 'warn');
+    const probe = detectProvider(rawKey, baseInput.value);
+    const conn = makeConnection({
+      ...(existing || {}),
+      name: nameInput.value.trim() || probe.name,
+      apiKey: rawKey,
+      provider: probe.id,
+      providerName: probe.name,
+      baseUrl: (baseInput.value.trim() || probe.baseUrl).replace(/\/+$/, ''),
+      apiStyle: styleSelect.value
+    });
+    upsertConnection(conn);
+    state.connections = getConnections();
+    editor.close();
+    if (modal && modal.refresh) modal.refresh();
+    renderConnChip();
+    toast(`Saved "${conn.name}".`, 'ok');
+  };
+  const editor = openModal({
+    title: existing ? 'Edit connection' : 'Add connection',
+    sub: 'Any key format works — provider is auto-detected.',
+    body: el('div', { class: 'conn-form' },
+      el('div', { class: 'field' }, el('label', { text: 'Name' }), nameInput),
+      el('div', { class: 'field' }, el('label', { text: 'API key' }), keyInput, detectEl),
+      el('div', { class: 'field' }, el('label', { text: 'Base URL' }), baseInput),
+      el('div', { class: 'field' }, el('label', { text: 'API style' }), styleSelect)),
+    footer: [
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', text: 'Cancel', onclick: () => editor.close() }),
+      el('button', { class: 'btn btn-primary', type: 'button', text: 'Save', onclick: save })]
+  });
+}
+
+function openConnectionsModal({ firstRun = false } = {}) {
+  const listHost = el('div', { class: 'conn-list' });
+  const bulkInput = el('textarea', { class: 'input mono', rows: '2', placeholder: 'Bulk add: paste one key per line…' });
+  const refresh = () => {
+    state.connections = getConnections();
+    listHost.innerHTML = '';
+    for (const conn of state.connections) listHost.append(connectionRow(conn));
+    renderConnChip();
+  };
+  modal = openModal({
+    title: firstRun ? 'Add an API key to begin' : 'Connections',
+    sub: 'Any provider, any format. Keys stay in your browser.',
+    size: 'wide',
+    body: el('div', {},
+      listHost,
+      el('div', { class: 'field', style: { marginTop: '12px' } },
+        el('label', { text: 'Bulk add (one key per line)' }),
+        bulkInput,
+        el('div', { class: 'row', style: { marginTop: '8px' } },
+          el('button', { class: 'btn btn-ghost', type: 'button', text: 'Add keys',
+            onclick: () => {
+              const lines = String(bulkInput.value || '').split('\n').map((s) => s.trim()).filter(Boolean);
+              if (!lines.length) return;
+              let added = 0;
+              for (const line of lines) {
+                const clean = normalizeApiKey(line);
+                if (!clean || state.connections.some((c) => c.apiKey === clean)) continue;
+                const probe = detectProvider(clean);
+                upsertConnection(makeConnection({ name: probe.name, apiKey: clean, provider: probe.id, providerName: probe.name, baseUrl: probe.baseUrl, apiStyle: probe.apiStyle }));
+                added++;
+              }
+              bulkInput.value = '';
+              refresh();
+              toast(`Added ${added} connection${added === 1 ? '' : 's'}.`, 'ok');
+            }}),
+          el('button', { class: 'btn btn-ghost', type: 'button', text: '＋ Add connection', onclick: () => openConnectionEditor(null) }))),
+      el('p', { class: 'hint', text: 'Tip: Test verifies a key with a tiny "Reply with exactly: OK" call.' })),
+    footer: [
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn btn-primary', type: 'button', text: 'Done', onclick: () => modal.close() })],
+    onClose: () => { modal = null; }
+  });
+  modal.refresh = refresh;
+  refresh();
+}
+
+/* ------------------------------------------------------------- model bar */
+
+function currentModelMeta() {
+  return state.catalog.find((m) => m.id === state.model) || null;
+}
+
+function renderModelPill() {
+  const meta = currentModelMeta();
+  const label = meta ? meta.label : state.model;
+  const conn = state.activeConnection;
+  const parts = [label];
+  if (meta && meta.isFree) parts.push('· FREE');
+  else if (meta) parts.push(`· ${priceLabel(meta)}`);
+  $('modelPillLabel').textContent = parts.join(' ');
+  $('modelPillConn').textContent = conn ? conn.providerName : 'no key';
+  const metaLine = [state.model];
+  if (meta && meta.contextLength) metaLine.push(formatContext(meta.contextLength));
+  if (meta && meta.description) metaLine.push(meta.description);
+  $('modelPillMeta').textContent = metaLine.join(' · ');
+}
+
+function setModel(modelId, { silent = false } = {}) {
+  state.model = modelId;
+  pushRecentModel(modelId);
+  state.recents = getRecents();
+  const settings = getSettings();
+  const map = { ...(settings.lastModelByConnection || {}) };
+  if (state.activeConnection) map[state.activeConnection.id] = modelId;
+  saveSettings({ lastModelByConnection: map });
+  renderModelPill();
+  if (!silent) toast(`Model: ${modelId}`, 'info', { title: 'Switched —', timeout: 2600 });
+}
+
+function toggleFavourite(modelId) {
+  const favs = new Set(state.favourites);
+  if (favs.has(modelId)) favs.delete(modelId);
+  else favs.add(modelId);
+  state.favourites = Array.from(favs);
+  saveSettings({ favourites: state.favourites });
+}
+
+function openModelPicker() {
+  clearBanner('model-unknown');
+  const queryInput = el('input', { class: 'input', placeholder: 'Search models, families, ids…', spellcheck: 'false' });
+  const freeOnly = el('input', { type: 'checkbox' });
+  const listHost = el('div', { class: 'model-list' });
+  const note = el('div', { class: 'muted small', style: { marginTop: '10px' } });
+
+  const dialog = openModal({
+    title: 'Choose a model',
+    sub: state.catalogLive ? 'Live catalogue from the active connection.' : 'Offline catalogue — reconnect to refresh.',
+    body: el('div', {},
+      el('div', { class: 'field' }, queryInput),
+      el('div', { class: 'model-picker-toolbar' },
+        el('label', { class: 'checkline' }, freeOnly, ' Free only'),
+        el('button', { class: 'mini-btn', type: 'button', text: 'Refresh catalog', onclick: () => { refreshCatalog(true); } })
+      ),
+      listHost,
+      el('div', { class: 'model-group' },
+        el('div', { class: 'model-group-title', text: 'Custom model id' }),
+        el('input', { class: 'input mono', id: 'customModelInput', placeholder: 'custom-model-id', spellcheck: 'false' }),
+        el('div', { class: 'hint', text: 'Press Enter to use a new id not in the catalog yet.' })
+      ),
+      note
+    ),
+    footer: []
+  });
+
+  const customInput = dialog.modal.querySelector('#customModelInput');
+  customInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const id = customInput.value.trim();
+      if (!id) return;
+      setModel(id);
+      dialog.close();
+    }
+  });
+
+  function rowFor(model) {
+    const fav = state.favourites.includes(model.id);
+    const recentIdx = state.recents.models.indexOf(model.id);
+    const btn = el('button', {
+      class: `model-row ${model.id === state.model ? 'is-active' : ''}`, type: 'button',
+      onclick: () => { setModel(model.id); dialog.close(); }
+    });
+    btn.append(
+      el('span', { class: 'model-glyph', text: familyGlyph(model.family) }),
+      el('span', { class: 'model-row-main' },
+        el('span', { class: 'model-row-top' },
+          el('span', { class: 'model-name', text: model.label }),
+          model.isFree ? el('span', { class: 'badge free tiny', text: 'FREE' }) : null,
+          model.tier === 'frontier' ? el('span', { class: 'badge tiny', text: 'frontier' }) : null,
+          recentIdx === 0 ? el('span', { class: 'badge tiny', text: 'recent' }) : null
+        ),
+        el('span', { class: 'model-id mono', text: model.id }),
+        model.description ? el('span', { class: 'model-desc', text: model.description }) : null
+      ),
+      el('span', { class: 'model-badges' },
+        el('span', { class: 'badge tiny', text: formatContext(model.contextLength) }),
+        el('span', { class: 'badge tiny', text: priceLabel(model) })
+      ),
+      el('span', {
+        class: `model-fav ${fav ? 'is-fav' : ''}`, text: fav ? '★' : '☆', title: 'Toggle favourite',
+        onclick: (e) => { e.stopPropagation(); toggleFavourite(model.id); render(); }
+      })
+    );
+    return btn;
+  }
+
+  function render() {
+    listHost.innerHTML = '';
+    const filtered = filterModels(state.catalog, {
+      query: queryInput.value, freeOnly: freeOnly.checked,
+      favourites: state.favourites, recents: state.recents.models
+    });
+    const favs = filtered.filter((m) => state.favourites.includes(m.id));
+    const recents = filtered.filter((m) => !state.favourites.includes(m.id) && state.recents.models.includes(m.id));
+    const rest = groupModels(filtered.filter((m) => !state.favourites.includes(m.id) && !state.recents.models.includes(m.id)));
+    if (favs.length) {
+      listHost.append(el('div', { class: 'model-group-title', text: '⭐ Favourites' }));
+      for (const m of favs) listHost.append(rowFor(m));
+    }
+    if (recents.length) {
+      listHost.append(el('div', { class: 'model-group-title', text: '🕘 Recent' }));
+      for (const m of recents) listHost.append(rowFor(m));
+    }
+    for (const g of rest) {
+      listHost.append(el('div', { class: 'model-group-title', text: g.title }));
+      for (const m of g.items) listHost.append(rowFor(m));
+    }
+    if (!filtered.length) listHost.append(el('div', { class: 'muted', text: 'No models match.' }));
+    note.textContent = state.catalogLive
+      ? `Live catalog · ${state.catalog.length} models · updated ${new Date(state.catalogUpdatedAt).toLocaleTimeString()}`
+      : `Offline catalog · ${state.catalog.length} models`;
+  }
+
+  queryInput.addEventListener('input', render);
+  freeOnly.addEventListener('change', render);
+  render();
+  queryInput.focus();
+}
+
+function loadConnections() {
+  state.connections = getConnections();
+  const settings = getSettings();
+  state.activeConnection = state.connections.find((c) => c.id === settings.activeConnectionId)
+    || state.connections[0] || null;
+  renderConnectionPill();
+}
+
+function setActiveConnection(id) {
+  saveSettings({ activeConnectionId: id });
+  loadConnections();
+  refreshCatalog(false);
+  renderModelPill();
+}
+
+function renderConnectionPill() {
+  const conn = state.activeConnection;
+  $('connPillDot').className = `conn-dot ${conn ? 'ok' : 'none'}`;
+  $('connPillName').textContent = conn ? conn.name : 'No key';
+  $('connPillMeta').textContent = conn ? `${conn.providerName} · ${maskApiKey(conn.apiKey)}` : 'add a key to start';
+}
+
+function openConnectionsModal({ firstRun = false } = {}) {
+  const listHost = el('div', { class: 'conn-list' });
+  const keyInput = el('input', { class: 'input mono', placeholder: 'Paste a key…  thk_live_… · sk-bl-… · sk-ant-…', spellcheck: 'false', autocomplete: 'off' });
+  const nameInput = el('input', { class: 'input', placeholder: 'Name (optional)', spellcheck: 'false' });
+  const detectLine = el('div', { class: 'hint' });
+
+  function renderList() {
+    listHost.innerHTML = '';
+    for (const conn of state.connections) {
+      const active = state.activeConnection && conn.id === state.activeConnection.id;
+      const row = el('div', { class: `conn-row ${active ? 'is-active' : ''}` },
+        el('span', { class: `conn-dot ${conn.apiKey ? 'ok' : 'none'}` }),
+        el('div', { class: 'conn-main' },
+          el('div', { class: 'conn-name', text: conn.name }),
+          el('div', { class: 'conn-sub mono', text: `${conn.providerName} · ${maskApiKey(conn.apiKey)}` })
+        ),
+        el('span', { class: 'conn-test', text: '' }),
+        el('button', { class: 'mini-btn', type: 'button', text: 'Test', onclick: () => testOneConnection(conn, row) }),
+        active
+          ? el('span', { class: 'badge tiny', text: 'active' })
+          : el('button', { class: 'mini-btn ok', type: 'button', text: 'Use', onclick: () => { setActiveConnection(conn.id); renderList(); } }),
+        el('button', { class: 'mini-btn danger', type: 'button', text: '✕', onclick: () => removeConnection(conn.id, renderList) })
+      );
+      listHost.append(row);
+    }
+  }
+  renderList();
+
+  function refreshDetect() {
+    const preset = detectProvider(keyInput.value, '');
+    detectLine.textContent = keyInput.value.trim()
+      ? `Detected: ${preset.name} · ${preset.baseUrl}`
+      : 'Any key format works — detected from the prefix.';
+  }
+  keyInput.addEventListener('input', refreshDetect);
+  refreshDetect();
+
+  const dialog = openModal({
+    title: firstRun ? 'Add your API key' : 'Connections',
+    sub: 'Every key format works — paste and go.',
+    body: el('div', {},
+      listHost,
+      el('div', { class: 'field' }, el('label', { text: 'New key' }), keyInput, detectLine),
+      el('div', { class: 'field' }, el('label', { text: 'Name' }), nameInput)
+    ),
+    footer: [
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn btn-ghost', type: 'button', text: 'Export JSON', onclick: exportConnections }),
+      el('button', { class: 'btn btn-ghost', type: 'button', text: 'Import JSON', onclick: importConnections }),
+      el('button', {
+        class: 'btn btn-primary', type: 'button', text: 'Add key',
+        onclick: () => {
+          const raw = keyInput.value.trim();
+          if (!raw) return toast('Paste a key first.', 'warn');
+          const preset = detectProvider(raw, '');
+          const conn = makeConnection({
+            name: nameInput.value.trim() || `${preset.name} key`,
+            apiKey: normalizeApiKey(raw),
+            baseUrl: preset.baseUrl,
+            provider: preset.id,
+            providerName: preset.name,
+            apiStyle: preset.apiStyle,
+            model: APP_CONFIG.defaultModel
+          });
+          upsertConnection(conn);
+          loadConnections();
+          setActiveConnection(conn.id);
+          renderList();
+          keyInput.value = '';
+          nameInput.value = '';
+          toast(`Added ${conn.name}.`, 'ok');
+        }
+      }),
+      el('button', { class: 'btn btn-ghost', type: 'button', text: 'Done', onclick: () => dialog.close() })
+    ]
+  });
+}
+
+async function testOneConnection(conn, row) {
+  const badge = row.querySelector('.conn-test');
+  badge.textContent = 'testing…';
+  try {
+    const res = await testConnection({ connection: conn, model: conn.model || state.model });
+    badge.textContent = `OK · ${res.latencyMs}ms`;
+    toast(`"${conn.name}" works.`, 'ok');
+  } catch (e) {
+    badge.textContent = 'failed';
+    showApiBanner(e);
+    toast(e.message || 'Connection test failed.', 'err');
+  }
+}
+
+async function removeConnection(id, rerender) {
+  const conn = state.connections.find((c) => c.id === id);
+  const ok = await confirmDialog({
+    title: 'Delete connection?',
+    message: `Remove "${conn ? conn.name : id}" from this browser?`,
+    confirmText: 'Delete', danger: true
+  });
+  if (!ok) return;
+  deleteConnection(id);
+  loadConnections();
+  rerender();
+}
+
+function exportConnections() {
+  const blob = new Blob([JSON.stringify({ connections: state.connections }, null, 2)], { type: 'application/json' });
+  const a = el('a', { href: URL.createObjectURL(blob), download: 'cline-web-connections.json' });
+  document.body.append(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+}
+
+function importConnections() {
+  const input = el('input', { type: 'file', accept: 'application/json' });
+  input.style.display = 'none';
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    input.remove();
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      const list = Array.isArray(parsed) ? parsed : parsed.connections || [];
+      for (const raw of list) {
+        if (!raw.apiKey) continue;
+        const preset = detectProvider(raw.apiKey, raw.baseUrl || '');
+        upsertConnection(makeConnection({
+          name: raw.name || `${preset.name} key`,
+          apiKey: normalizeApiKey(raw.apiKey),
+          baseUrl: raw.baseUrl || preset.baseUrl,
+          provider: raw.provider || preset.id,
+          providerName: raw.providerName || preset.name,
+          apiStyle: raw.apiStyle || preset.apiStyle,
+          model: raw.model || APP_CONFIG.defaultModel
+        }));
+      }
+      loadConnections();
+      toast('Connections imported.', 'ok');
+    } catch { toast('Could not read that file.', 'err'); }
+  });
+  document.body.append(input);
+  input.click();
+}
+
+/* ------------------------------------------------------------ catalog */
+
+function seedCatalog() {
+  const fallback = (DEFAULT_CATALOG[state.activeConnection?.provider] || DEFAULT_CATALOG.tokenharbor || []);
+  state.catalog = fallback;
+  state.catalogByProvider[state.activeConnection?.provider || 'tokenharbor'] = fallback;
+  state.catalogLive = false;
+}
+
+async function refreshCatalog(force = false) {
+  if (!state.activeConnection) { seedCatalog(); renderModelPill(); return; }
+  const key = state.activeConnection.provider || 'custom';
+  if (!force && state.catalogByProvider[key]) {
+    state.catalog = state.catalogByProvider[key];
+    renderModelPill();
+    return;
+  }
+  seedCatalog();
+  renderModelPill();
+  if (!state.activeConnection.apiKey) return;
+  try {
+    const live = await listModels(state.activeConnection);
+    if (live && live.length) {
+      state.catalog = live;
+      state.catalogByProvider[key] = live;
+      state.catalogLive = true;
+      state.catalogUpdatedAt = Date.now();
+      ensureCurrentModelKnown();
+      renderModelPill();
+    }
+  } catch (e) {
+    state.catalogLive = false;
+    if (force) showApiBanner(e);
+  }
+}
+
+function ensureCurrentModelKnown() {
+  if (!state.model) return;
+  const known = state.catalog.some((m) => m.id === state.model);
+  if (!known) {
+    const suggestion = suggestModel(state.model, state.catalog);
+    banner('model-unknown', {
+      kind: 'warn',
+      title: 'Unknown model id.',
+      message: `"${state.model}" is not in this provider's catalog.`,
+      hint: suggestion ? `Did you mean "${suggestion}"? Open the model picker to switch.` : 'Open the model picker to choose a known model.'
+    });
+  }
+}
+
+/* ---------------------------------------------------------------- errors */
+
+function showApiBanner(err) {
+  if (!err) return;
+  const status = err.status || 0;
+  if (status === 401) {
+    banner('api', { kind: 'err', title: 'Invalid API key (401).', message: err.message || '', hint: 'Open Connections and check the key for typos, or rotate it.' });
+  } else if (status === 402) {
+    banner('api', { kind: 'warn', title: 'Out of credits (402).', message: err.message || '', hint: 'Top up, or switch to a FREE model from the picker.' });
+  } else if (status === 403) {
+    banner('api', { kind: 'err', title: 'Request denied (403).', message: err.message || '', hint: err.hint || 'Check email verification or key permissions in the provider dashboard.' });
+  } else if (status === 429) {
+    banner('api', { kind: 'warn', title: 'Rate limited (429).', message: err.retryAfter ? `Retry in ${err.retryAfter}s.` : (err.message || ''), hint: 'The app already backs off automatically.' });
+  } else if (status === 404) {
+    banner('api', { kind: 'err', title: 'Not found (404).', message: err.message || '', hint: 'The model id or endpoint may be wrong — pick a catalog model.' });
+  } else {
+    banner('api', { kind: 'err', title: `Request failed${status ? ` (${status})` : ''}.`, message: err.message || String(err), hint: err.hint || '' });
+  }
+}
+
+/* -------------------------------------------------------- context + input */
+
+function updateUsageBar(usage) {
+  const text = usage.input || usage.output
+    ? `${usage.input.toLocaleString()} in · ${usage.output.toLocaleString()} out${state.cacheLayer ? ` · cache ${state.cacheLayer}` : ''}`
+    : 'tokens will appear here';
+  $('usageBar').textContent = text;
+}
+
+function renderContextChips() {
+  const host = $('contextChips');
+  host.innerHTML = '';
+  for (const path of state.contextFiles) {
+    host.append(el('span', { class: 'context-chip' },
+      el('span', { class: 'mono', text: path }),
+      el('button', { type: 'button', text: '✕', title: 'Remove from context', onclick: () => removeContextFile(path) })
+    ));
+  }
+  host.classList.toggle('hidden', !state.contextFiles.length);
+}
+
+function addContextFile(path) {
+  if (!path || state.contextFiles.includes(path)) return;
+  state.contextFiles.push(path);
+  renderContextChips();
+  toast(`Added context: ${path}`, 'info', { timeout: 2000 });
+}
+
+function removeContextFile(path) {
+  state.contextFiles = state.contextFiles.filter((p) => p !== path);
+  renderContextChips();
+}
+
+function openContextPicker() {
+  if (!workspace.ready) return toast('Open a folder first, then add context files.', 'warn');
+  const filter = el('input', { class: 'input', placeholder: 'Filter files…', spellcheck: 'false' });
+  const host = el('div', { class: 'model-list' });
+  const dialog = openModal({ title: 'Add context files', sub: 'Reference files without editing them.', body: el('div', {}, filter, host), footer: [] });
+
+  async function collect(prefix = '', handle = workspace.root, depth = 0) {
+    const out = [];
+    if (workspace.mode === 'zip') return workspace.zipFiles.map((f) => f.path);
+    if (depth > 4) return out;
+    for await (const [name, entry] of handle.entries()) {
+      const path = joinPath(prefix, name);
+      if (entry.kind === 'directory') {
+        if (workspace.ignorePatterns.some((re) => re.test(name))) continue;
+        out.push(...await collect(path, entry, depth + 1));
+      } else {
+        out.push(path);
+      }
+      if (out.length > 500) break;
+    }
+    return out;
+  }
+
+  collect().then((all) => {
+    const render = () => {
+      host.innerHTML = '';
+      const q = filter.value.trim().toLowerCase();
+      for (const path of all.filter((p) => !q || p.toLowerCase().includes(q)).slice(0, 200)) {
+        const inCtx = state.contextFiles.includes(path);
+        host.append(el('button', {
+          class: `model-row ${inCtx ? 'is-active' : ''}`, type: 'button',
+          onclick: () => { inCtx ? removeContextFile(path) : addContextFile(path); render(); }
+        }, el('span', { class: 'model-name mono', text: path }), el('span', { class: 'model-fav', text: inCtx ? '✓' : '+' })));
+      }
+    };
+    filter.addEventListener('input', render);
+    render();
+    filter.focus();
+  });
+}
+
+function renderAttachments() {
+  const host = $('attachPreview');
+  host.innerHTML = '';
+  state.attachments.forEach((a, i) => {
+    host.append(el('span', { class: 'attach-thumb' },
+      el('img', { src: a.dataUrl, alt: a.name }),
+      el('button', { type: 'button', text: '✕', onclick: () => { state.attachments.splice(i, 1); renderAttachments(); } })
+    ));
+  });
+}
+
+function autosizeInput() {
+  const input = $('promptInput');
+  input.style.height = 'auto';
+  input.style.height = `${Math.min(180, Math.max(56, input.scrollHeight))}px`;
+}
+
+/* --------------------------------------------------------------- settings */
+
+function openSettings() {
+  const settings = getSettings();
+  const body = el('div', {});
+  const tempRow = el('div', { class: 'field' },
+    el('label', { text: `Temperature · ${Number(settings.temperature).toFixed(1)}` }),
+    el('input', { type: 'range', min: 0, max: 1, step: 0.1, value: settings.temperature })
+  );
+  const maxRow = el('div', { class: 'field' },
+    el('label', { text: 'Max output tokens' }),
+    el('input', { class: 'input mono', type: 'number', min: 256, max: 128000, value: settings.maxTokens })
+  );
+  const stepRow = el('div', { class: 'field' },
+    el('label', { text: 'Max agent steps (loop guard)' }),
+    el('input', { class: 'input mono', type: 'number', min: 1, max: 25, value: settings.maxSteps })
+  );
+  const ignoreRow = el('div', { class: 'field' },
+    el('label', { text: 'Ignored files (comma globs)' }),
+    el('textarea', { class: 'input mono', rows: 2 }, settings.ignoreGlobs)
+  );
+  body.append(
+    tempRow, maxRow, stepRow,
+    switchControl(settings.stream, (v) => saveSettings({ stream: v }), 'Stream responses', 'Token-by-token output.'),
+    switchControl(settings.autoCreateFolder, (v) => saveSettings({ autoCreateFolder: v }), 'Auto-create project folder', 'Name the workspace from your first prompt.'),
+    switchControl(settings.theme === 'light', (v) => { saveSettings({ theme: v ? 'light' : 'dark' }); applyTheme(); }, 'Light theme', 'Or keep the deep-space dark theme.'),
+    el('div', { class: 'field' }, el('label', { text: 'Auto-approve' })),
+    switchControl(settings.autoApprove.file, (v) => saveSettings({ autoApprove: { ...getSettings().autoApprove, file: v } }), 'New files', 'Apply file: blocks without asking.'),
+    switchControl(settings.autoApprove.edit, (v) => saveSettings({ autoApprove: { ...getSettings().autoApprove, edit: v } }), 'Edits', 'Apply edit: patches without asking.'),
+    switchControl(settings.autoApprove.folder, (v) => saveSettings({ autoApprove: { ...getSettings().autoApprove, folder: v } }), 'Folders', 'Apply folder: blocks without asking.'),
+    switchControl(settings.autoApprove.delete, (v) => saveSettings({ autoApprove: { ...getSettings().autoApprove, delete: v } }), 'Deletes', 'Off is strongly recommended.'),
+    ignoreRow
+  );
+
+  const dialog = openModal({
+    title: 'Settings',
+    sub: 'Generation, approvals and the explorer ignore list.',
+    body,
+    footer: [
+      el('div', { class: 'spacer' }),
+      el('button', {
+        class: 'btn btn-primary', type: 'button', text: 'Save',
+        onclick: () => {
+          saveSettings({
+            temperature: Number(tempRow.querySelector('input').value) || 0.2,
+            maxTokens: Math.max(256, Number(maxRow.querySelector('input').value) || 4096),
+            maxSteps: Math.min(25, Math.max(1, Number(stepRow.querySelector('input').value) || 6)),
+            ignoreGlobs: ignoreRow.querySelector('textarea').value
+          });
+          renderModelPill();
+          renderTree();
+          dialog.close();
+          toast('Settings saved.', 'ok');
+        }
+      })
+    ]
+  });
+}
+
+function applyTheme() {
+  document.body.dataset.theme = getSettings().theme || 'dark';
+}
+
+async function restoreWorkspace() {
+  if (!supportsFileSystemAccess()) { await refreshWorkspaceUI(); return; }
+  try {
+    const handle = await loadRootHandle();
+    if (!handle) { await refreshWorkspaceUI(); return; }
+    const ok = await verifyPermission(handle, 'readwrite', false);
+    if (!ok) {
+      workspace.ready = false;
+      banner('workspace', {
+        kind: 'warn', title: 'Workspace needs permission again.',
+        message: `“${handle.name}” was open last time. Use Open folder to grant access again.`,
+        hint: ''
+      });
+      await refreshWorkspaceUI();
+      return;
+    }
+    workspace.root = handle;
+    workspace.name = handle.name || 'workspace';
+    workspace.mode = 'fsa';
+    workspace.ready = true;
+    await refreshWorkspaceUI();
+  } catch { await refreshWorkspaceUI(); }
+}
+
+/* ------------------------------------------------------------------ boot */
+
+function bindStaticUI() {
+  $('btn-open-folder-top').addEventListener('click', openWorkspaceFolder);
+  $('btn-open-folder-side').addEventListener('click', openWorkspaceFolder);
+  $('btn-zip-mode').addEventListener('click', openZipMode);
+  $('btn-zip-download').addEventListener('click', downloadZip);
+  $('btn-close-ws').addEventListener('click', forgetWorkspace);
+  $('folderChip').addEventListener('click', () => { if (!workspace.ready) openWorkspaceFolder(); });
+  $('connPill').addEventListener('click', () => openConnectionsModal());
+  $('modelPill').addEventListener('click', openModelPicker);
+  $('btn-settings').addEventListener('click', openSettings);
+  $('btn-undo').addEventListener('click', openUndoPanel);
+  $('btn-refresh-models').addEventListener('click', () => refreshCatalog(true));
+  $('btn-context').addEventListener('click', openContextPicker);
+  $('btn-attach').addEventListener('click', () => $('fileInput').click());
+  $('btn-stop').addEventListener('click', () => agent.stop());
+  $('btn-preview-close').addEventListener('click', closePreview);
+  $('btn-preview-context').addEventListener('click', () => { if (state.currentPreview) addContextFile(state.currentPreview); });
+  $('sidebarSearch').addEventListener('input', () => renderTree());
+  $('themeToggle').addEventListener('change', () => {
+    saveSettings({ theme: getSettings().theme === 'light' ? 'dark' : 'light' });
+    applyTheme();
+  });
+  $('btn-new-chat').addEventListener('click', () => {
+    agent.reset();
+    agent.stop();
+    $('messages').innerHTML = '';
+    $('emptyState').classList.remove('hidden');
+    renderStarters();
+    state.contextFiles = [];
+    renderContextChips();
+  });
+
+  $('fileInput').addEventListener('change', async () => {
+    for (const file of $('fileInput').files) {
+      if (!file.type.startsWith('image/')) { toast(`${file.name} is not an image — skipped.`, 'warn'); continue; }
+      try {
+        state.attachments.push({ name: file.name, dataUrl: await readFileAsDataUrl(file) });
+      } catch { toast(`Could not read ${file.name}.`, 'err'); }
+    }
+    $('fileInput').value = '';
+    renderAttachments();
+  });
+
+  $('chatForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    runPrompt($('promptInput').value);
+  });
+  $('promptInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      runPrompt($('promptInput').value);
+    }
+  });
+  $('promptInput').addEventListener('input', autosizeInput);
+}
+
+async function init() {
+  applyTheme();
+  bindStaticUI();
+  renderStarters();
+  renderAttachments();
+  renderContextChips();
+  updateUsageBar(state.usage);
+  setStorageMode(getStorageMode() || 'local');
+  loadConnections();
+  const settings = getSettings();
+  state.favourites = settings.favourites || [];
+  state.recents = getRecents();
+  state.model = (state.activeConnection && settings.lastModelByConnection?.[state.activeConnection.id])
+    || state.activeConnection?.model
+    || APP_CONFIG.defaultModel;
+  seedCatalog();
+  renderModelPill();
+  $('themeToggle').checked = getSettings().theme === 'light';
+  await refreshUndoCount();
+  await restoreWorkspace();
+  await refreshCatalog(false);
+  renderModelPill();
+  autosizeInput();
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  init().catch((e) => {
+    console.error(e);
+    toast('Something went wrong during startup — check the console.', 'err');
+  });
+});

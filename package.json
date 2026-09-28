@@ -1,0 +1,12 @@
+{
+  "name": "cline-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A browser-based Cline-style AI coding chat that writes real files into a folder you pick.",
+  "scripts": {
+    "start": "python -m http.server 5500",
+    "test": "node tests/smoke.mjs && node tests/selectors.mjs",
+    "check": "node --check src/config.js && node --check src/models.js && node --check src/providers.js && node --check src/store.js && node --check src/fs.js && node --check src/zip.js && node --check src/api.js && node --check src/tools.js && node --check src/agent.js && node --check src/ui.js"
+  }
+}

@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cline Web — ChatGPT-style AI coding agent</title>
+<meta name="description" content="A browser-based, ChatGPT-style AI coding assistant. Pick a folder, chat, and let the model create and edit real files on your disk.">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<div class="aurora" aria-hidden="true"></div>
+<div class="grid-overlay" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <button id="btn-toggle-sidebar" class="icon-btn" type="button" title="Toggle sidebar" aria-label="Toggle sidebar">☰</button>
+
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">⚡</span>
+      <span class="brand-text">Cline<em>Web</em></span>
+    </div>
+
+    <button id="modelPill" class="pill model-pill" type="button" title="Choose a model">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="modelPillLabel" class="pill-label">Loading models…</span>
+      <span id="modelPillPrice" class="pill-sub"></span>
+      <span class="pill-caret" aria-hidden="true">▾</span>
+    </button>
+  </div>
+
+  <div class="topbar-center">
+    <button id="folderChip" class="pill folder-chip" type="button" title="Open or change workspace folder">
+      <span aria-hidden="true">📁</span>
+      <span id="folderChipName" class="pill-label">No folder open</span>
+      <span id="folderChipPerm" class="pill-sub"></span>
+    </button>
+  </div>
+
+  <div class="topbar-right">
+    <button id="btn-connections" class="icon-btn" type="button" title="Connections &amp; API keys" aria-label="Connections and API keys">🔑</button>
+    <button id="btn-settings" class="icon-btn" type="button" title="Settings" aria-label="Settings">⚙</button>
+    <button id="btn-theme" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">🌗</button>
+  </div>
+</header>
+
+<div id="bannerHost" class="banner-host" role="status" aria-live="polite"></div>
+
+<main class="layout">
+  <aside id="sidebar" class="sidebar" aria-label="Workspace explorer">
+    <div class="sidebar-head">
+      <span class="sidebar-title">Explorer</span>
+      <div class="sidebar-actions">
+        <button id="btn-undo" class="mini-btn" type="button" title="Undo history">↩ <span id="undoCount">0</span></button>
+        <button id="btn-refresh-tree" class="mini-btn" type="button" title="Refresh">⟳</button>
+      </div>
+    </div>
+
+    <div class="sidebar-controls">
+      <input id="sidebarSearch" class="mini-input" type="search" placeholder="Filter files…" aria-label="Filter files">
+    </div>
+
+    <div id="workspaceBar" class="workspace-bar">
+      <button id="btn-open-folder-side" class="btn btn-primary btn-block" type="button">Open folder…</button>
+      <button id="btn-reconnect-folder" class="btn btn-ghost btn-block hidden" type="button">Reconnect folder</button>
+      <button id="btn-zip-mode" class="btn btn-ghost btn-block" type="button">Read-only (ZIP) mode…</button>
+    </div>
+
+    <nav id="treeRoot" class="tree" aria-label="Files"></nav>
+
+    <div id="zipBar" class="zip-bar hidden">
+      <span id="zipBarLabel" class="muted small">Read-only mode</span>
+      <button id="btn-download-zip" class="btn btn-primary btn-sm" type="button">Download .zip</button>
+    </div>
+  </aside>
+
+  <section class="chat" aria-label="Chat">
+    <div id="chatScroll" class="chat-scroll">
+      <div id="emptyState" class="empty-state">
+        <div class="empty-badge" aria-hidden="true">⚡</div>
+        <h1>What should we <span class="grad">build today?</span></h1>
+        <p class="muted">Pick a model, open a folder — or just start typing and I'll scaffold one. Every file the model writes lands on your real disk.</p>
+        <div id="starterList" class="starters"></div>
+      </div>
+      <div id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
+    </div>
+
+    <div id="stepStrip" class="step-strip hidden" role="status" aria-live="polite">
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="stepText">Thinking…</span>
+      <button id="btn-stop" class="mini-btn danger" type="button">Stop</button>
+    </div>
+<div class="composer-wrap">
+      <div id="contextChips" class="context-chips"></div>
+      <div id="attachments" class="attachments"></div>
+      <div class="composer">
+        <textarea id="promptInput" class="composer-input" rows="1" placeholder="Ask Cline to build, fix or refactor…  (Enter to send · Shift+Enter for newline)"></textarea>
+        <div class="composer-side">
+          <button id="btn-attach" class="icon-btn" type="button" title="Attach an image">🖼</button>
+          <input id="attachInput" type="file" accept="image/*" multiple hidden>
+          <div class="composer-grow" aria-hidden="true"></div>
+          <button id="btn-send" class="send-btn" type="button" title="Send" aria-label="Send message">➤</button>
+        </div>
+      </div>
+      <div class="usage-bar">
+        <span id="usageModel" class="muted small"></span>
+        <span id="usageTokens" class="muted small">0 tokens</span>
+        <span id="usageCost" class="muted small">$0.0000</span>
+        <span id="cacheBadge" class="badge hidden"></span>
+        <div class="usage-spacer"></div>
+        <span id="wsStatus" class="muted small"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="previewDrawer" class="preview-drawer hidden" aria-label="File preview">
+    <div class="preview-head">
+      <span id="previewTitle" class="preview-title">file</span>
+      <div class="preview-actions">
+        <button id="btn-add-context" class="mini-btn" type="button" title="Add this file to the prompt">＋context</button>
+        <button id="btn-close-preview" class="mini-btn" type="button" title="Close">✕</button>
+      </div>
+    </div>
+    <pre id="previewBody" class="preview-body"></pre>
+  </section>
+</main>
+
+<div id="modalHost" class="modal-host"></div>
+<div id="toastHost" class="toast-host" role="status" aria-live="polite"></div>
+
+<script type="module" src="./src/ui.js"></script>
+</body>
+</html>
